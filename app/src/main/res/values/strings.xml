@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">Dial Record Labs</string>
+    <string name="accessibility_description">当通过 Dial Record Labs App 发起通话时，辅助尝试在通话期间采集麦克风音频，无法保证录到对方声音。</string>
+</resources>

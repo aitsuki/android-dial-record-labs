@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    xmlns:tools="http://schemas.android.com/tools"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:gravity="center_horizontal"
+    android:orientation="vertical"
+    android:padding="24dp"
+    tools:ignore="HardcodedText">
+
+    <EditText
+        android:id="@+id/phone_number"
+        android:layout_width="wrap_content"
+        android:layout_height="48dp"
+        android:hint="请输入电话号码"
+        android:importantForAutofill="no"
+        android:inputType="phone"
+        android:maxLength="40"
+        android:minWidth="320dp" />
+
+    <com.google.android.material.button.MaterialButton
+        android:id="@+id/dial_button"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="8dp"
+        android:minWidth="320dp"
+        android:text="拨打电话并自动录音" />
+
+    <androidx.recyclerview.widget.RecyclerView
+        android:id="@+id/recording_list"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:layout_marginTop="16dp"
+        android:orientation="vertical"
+        app:layoutManager="androidx.recyclerview.widget.LinearLayoutManager"
+        tools:itemCount="5"
+        tools:listitem="@layout/item_recording" />
+
+</LinearLayout>
