@@ -1,10 +1,7 @@
 package com.aitsuki.labs.dialrecord.ui
 
-import android.Manifest.permission.CALL_PHONE
 import android.Manifest.permission.POST_NOTIFICATIONS
-import android.Manifest.permission.READ_CALL_LOG
-import android.Manifest.permission.READ_PHONE_STATE
-import android.Manifest.permission.RECORD_AUDIO
+import android.annotation.SuppressLint
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
@@ -15,307 +12,262 @@ import android.os.Looper
 import android.os.ResultReceiver
 import android.provider.Settings
 import android.telephony.PhoneNumberUtils
-import android.util.Log
+import android.text.InputType
+import android.view.View
+import android.widget.ArrayAdapter
+import android.widget.EditText
 import android.widget.Toast
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.lifecycle.Lifecycle
 import com.aitsuki.labs.dialrecord.accessibility.CallAccessibilityService
+import com.aitsuki.labs.dialrecord.data.CallSource
+import com.aitsuki.labs.dialrecord.data.PHONE_NUMBER_PATTERN
+import com.aitsuki.labs.dialrecord.data.RecordingEntry
 import com.aitsuki.labs.dialrecord.data.RecordingStore
 import com.aitsuki.labs.dialrecord.databinding.ActivityMainBinding
-import com.aitsuki.labs.dialrecord.recording.CallSessionService
-import com.aitsuki.labs.dialrecord.recording.CallSessionResult
+import com.aitsuki.labs.dialrecord.recording.RecordingResult
+import com.aitsuki.labs.dialrecord.recording.RecordingService
 import java.lang.ref.WeakReference
 import java.util.UUID
 
-private const val TAG = "MainActivity"
-
 class MainActivity : AppCompatActivity() {
     private lateinit var binding: ActivityMainBinding
-
-    private val requiredPermissions = arrayOf(CALL_PHONE, READ_CALL_LOG, RECORD_AUDIO, READ_PHONE_STATE)
-    private var numberAwaitingPermissions: String? = null
-    private var notificationPermissionRequested = false
-
-    private var preparingSessionToken: String? = null // 等待服务准备完成，尚未打开系统拨号界面。
     private val handler = Handler(Looper.getMainLooper())
-    private val adapter = RecordingAdapter()
-    private var awaitingResultToken: String? = null
+    private val adapter = RecordingAdapter { editDuration(it) }
+    private var pendingRequest: Request? = null
+    private var preparingId: String? = null
+    private var activeRequest: Request? = null
+    private var awaitingId: String? = null
 
-    // 静态嵌套类，只弱引用发起请求的页面，避免服务持有已销毁的 Activity。
-    private class CallSessionPreparationReceiver(
-        activity: MainActivity,
-        private val sessionToken: String,
-        private val number: String,
-    ) : ResultReceiver(Handler(Looper.getMainLooper())) {
+    private data class Request(val source: CallSource, val phoneNumber: String)
+
+    private class EventReceiver(activity: MainActivity) : ResultReceiver(Handler(Looper.getMainLooper())) {
         private val owner = WeakReference(activity)
-
+        private val app = activity.applicationContext
         override fun onReceiveResult(resultCode: Int, resultData: Bundle?) {
-            val activity = owner.get() ?: return
-            if (activity.isFinishing || activity.isDestroyed) return
-            activity.onCallSessionPreparationResult(sessionToken, number, resultCode, resultData)
-        }
-    }
-
-    // 静态嵌套类，只弱引用发起请求的页面，避免服务持有已销毁的 Activity。
-    private class CallSessionCompletionReceiver(activity: MainActivity) :
-        ResultReceiver(Handler(Looper.getMainLooper())) {
-        private val owner = WeakReference(activity)
-
-        override fun onReceiveResult(resultCode: Int, resultData: Bundle?) {
-            if (resultCode != CallSessionService.RESULT_SESSION_FINISHED || resultData == null) return
-            val activity = owner.get() ?: return
-            if (activity.isFinishing || activity.isDestroyed) return
-            val result = runCatching { CallSessionResult.fromBundle(resultData) }
-                .getOrElse {
-                    Log.w(TAG, "无法解析会话结果", it)
-                    return
+            if (resultCode != RecordingService.RESULT_EVENT || resultData == null) return
+            val result = RecordingResult.fromBundle(resultData)
+            val activity = owner.get()
+            if (activity == null || activity.isDestroyed || activity.isFinishing) {
+                if (result.event == RecordingResult.Event.READY) {
+                    runCatching { RecordingService.cancelPreparation(app, result.recordingId) }
                 }
-            activity.onCallSessionCompletionResult(result)
-        }
-    }
-
-    /** 处理通话会话准备结果，校验当前请求和页面状态后发起拨号。 */
-    private fun onCallSessionPreparationResult(
-        sessionToken: String,
-        number: String,
-        resultCode: Int,
-        resultData: Bundle?,
-    ) {
-        Log.d(
-            TAG,
-            "onReceiveResult: resultCode=$resultCode, preparingSessionToken=$preparingSessionToken, sessionToken=$sessionToken"
-        )
-        if (preparingSessionToken != sessionToken) {
-            Log.w(TAG, "onReceiveResult: 忽略非当前准备会话的回调 sessionToken=$sessionToken")
-            return
-        }
-        preparingSessionToken = null
-        if (resultCode != CallSessionService.RESULT_SESSION_READY) {
-            val errorMessage =
-                resultData?.getString(CallSessionService.EXTRA_ERROR_MESSAGE) ?: "无法启动录音服务"
-            Log.w(TAG, "onReceiveResult: 服务启动失败，sessionToken=$sessionToken, error=$errorMessage")
-            // 失败提示由独立的完成回调统一处理。
-            return
-        }
-
-        if (!lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) {
-            Log.w(TAG, "onReceiveResult: 服务准备期间离开页面，取消等待会话 sessionToken=$sessionToken")
-            cancelWaitingSession(sessionToken)
-            return
-        }
-        runCatching {
-            Log.d(TAG, "onReceiveResult: 开始拨号 $number, sessionToken=$sessionToken")
-            startActivity(Intent(Intent.ACTION_CALL, Uri.fromParts("tel", number, null)))
-        }.onFailure {
-            Log.e(TAG, "onReceiveResult: 拨号失败 $number, sessionToken=$sessionToken", it)
-            cancelWaitingSession(sessionToken)
-            onCallSessionCompletionResult(CallSessionResult(
-                sessionToken, number, CallSessionResult.Outcome.FAILED,
-                errorMessage = "拨号失败：${it.message}",
-            ))
-        }
-    }
-
-    /** 接收通话会话终态，过滤过期或重复结果后交给业务回调。 */
-    private fun onCallSessionCompletionResult(result: CallSessionResult) {
-        if (awaitingResultToken != result.sessionToken) return
-        awaitingResultToken = null
-        onCallSessionFinished(result)
-    }
-
-    /** 仅向原页面交付结果；以后可在这里按 sessionToken 转发到 H5。 */
-    private fun onCallSessionFinished(result: CallSessionResult) {
-        Log.d(TAG, "会话结束：$result")
-        val message = when (result.outcome) {
-            CallSessionResult.Outcome.COMPLETED ->
-                if (result.recording?.callLog != null) "通话录音已保存，通话记录已关联"
-                else "通话录音已保存，未匹配到通话记录"
-            CallSessionResult.Outcome.CANCELLED -> "拨号会话已取消"
-            CallSessionResult.Outcome.TIMED_OUT -> "等待拨号超时"
-            CallSessionResult.Outcome.FAILED -> result.errorMessage ?: "拨号录音失败"
-        }
-        showToast(message)
-    }
-
-    private val refreshRecordingsTask = object : Runnable {
-        override fun run() {
-            adapter.update(
-                RecordingStore.directory(this@MainActivity).listFiles()
-                    ?.filter { it.isFile && it.extension == "m4a" }
-                    ?.sortedByDescending { it.name.substringAfter('_') }
-                    .orEmpty(),
-                RecordingStore.loadEntries(this@MainActivity),
-            )
-            handler.postDelayed(this, 2_000)
+                return
+            }
+            activity.onRecordingEvent(result)
         }
     }
 
     private val permissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
-            val number = numberAwaitingPermissions ?: return@registerForActivityResult
-            numberAwaitingPermissions = null
-            if (requiredPermissions.all { hasPermission(it) }) {
-                dial(number)
-            } else {
-                showToast("拨号录音需要电话、麦克风及通话记录权限")
-            }
+            val request = pendingRequest ?: return@registerForActivityResult
+            pendingRequest = null
+            if (RecordingService.requiredPermissions.all(::hasPermission)) prepare(request)
+            else showToast("录音需要电话、电话状态、通话记录及麦克风权限")
         }
+
+    private val refresh = object : Runnable {
+        override fun run() {
+            refreshRecordings()
+            handler.postDelayed(this, 2_000)
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        numberAwaitingPermissions = savedInstanceState?.getString("numberAwaitingPermissions")
-        notificationPermissionRequested =
-            savedInstanceState?.getBoolean("notificationPermissionRequested") ?: false
-        Log.d(TAG, "onCreate: numberAwaitingPermissions=$numberAwaitingPermissions")
+        savedInstanceState?.getString("pendingSource")?.let {
+            pendingRequest = Request(CallSource.valueOf(it),
+                savedInstanceState.getString("pendingPhoneNumber").orEmpty())
+        }
         enableEdgeToEdge()
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
         val padding = (24 * resources.displayMetrics.density).toInt()
         ViewCompat.setOnApplyWindowInsetsListener(binding.root) { view, insets ->
-            val bars =
-                insets.getInsets(WindowInsetsCompat.Type.systemBars() or WindowInsetsCompat.Type.ime())
-            view.setPadding(
-                padding + bars.left,
-                padding + bars.top,
-                padding + bars.right,
-                padding + bars.bottom
-            )
+            val bars = insets.getInsets(WindowInsetsCompat.Type.systemBars() or WindowInsetsCompat.Type.ime())
+            view.setPadding(padding + bars.left, padding + bars.top, padding + bars.right, padding + bars.bottom)
             insets
+        }
+        binding.source.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item,
+            listOf("系统电话（自动录音）", "SDK 通话（手动验证入口）"))
+        binding.source.onItemSelectedListener = object : android.widget.AdapterView.OnItemSelectedListener {
+            override fun onNothingSelected(parent: android.widget.AdapterView<*>?) = Unit
+            override fun onItemSelected(parent: android.widget.AdapterView<*>?, view: View?, position: Int, id: Long) {
+                binding.dialButton.text = if (position == 0) "拨打电话并录音" else "开始录音"
+            }
         }
         binding.recordingList.adapter = adapter
         binding.dialButton.setOnClickListener {
-            dial(binding.phoneNumber.text.toString())
+            val source = CallSource.entries[binding.source.selectedItemPosition]
+            val rawPhoneNumber = binding.phoneNumber.text.toString().trim()
+            val phoneNumber = PhoneNumberUtils.normalizeNumber(rawPhoneNumber)
+            requestPermissionsAndPrepare(Request(source, phoneNumber))
+        }
+        binding.stopButton.setOnClickListener {
+            RecordingService.session?.let {
+                runCatching { RecordingService.finish(this, it.recordingId) }
+                    .onFailure { showToast(it.message.orEmpty()) }
+            }
         }
     }
 
     private fun hasPermission(permission: String) =
         ContextCompat.checkSelfPermission(this, permission) == PackageManager.PERMISSION_GRANTED
 
-    /** All dial entry points share validation and session guards, independently of the button. */
-    private fun dial(rawNumber: String) {
-        // Serialize callers on the main thread, including future non-UI entry points.
-        if (Looper.myLooper() != Looper.getMainLooper()) {
-            handler.post { dial(rawNumber) }
+    private fun requestPermissionsAndPrepare(request: Request) {
+        if (pendingRequest != null || preparingId != null || RecordingService.hasSession) {
+            showToast("请先结束当前录音会话")
             return
         }
-        Log.d(TAG, "dial: number=$rawNumber")
-        if (isFinishing || isDestroyed) {
-            Log.w(TAG, "dial: 页面已结束 isFinishing=$isFinishing, isDestroyed=$isDestroyed")
+        if (!PHONE_NUMBER_PATTERN.matches(request.phoneNumber)) {
+            showToast("请输入有效的电话号码")
             return
         }
-
-        // preparingSessionToken 只保护服务准备回调，不表示通话状态。
-        if (preparingSessionToken != null) {
-            Log.d(TAG, "dial: 等待服务准备回调，忽略重复提交 preparingSessionToken=$preparingSessionToken")
-            showToast("正在准备拨号，请稍后再试")
-            return
-        }
-        if (!CallSessionService.canStartDial) {
-            Log.d(TAG, "dial: 会话正在通话或收尾，拒绝新请求")
-            showToast("正在通话或处理录音，请稍后再试")
-            return
-        }
-
-        val number = PhoneNumberUtils.normalizeNumber(rawNumber.trim())
-        if (!Regex("\\+?[0-9]{1,32}").matches(number)) {
-            showToast("请输入有效的电话号码（支持国际区号）")
-            return
-        }
-        val missing = requiredPermissions.filterNot { hasPermission(it) }.toMutableList()
-        // Optional: denial must not cause a request loop when the permission callback re-enters dial.
-        if (Build.VERSION.SDK_INT >= 33 && !hasPermission(POST_NOTIFICATIONS) && !notificationPermissionRequested) {
+        val missing = RecordingService.requiredPermissions.filterNot(::hasPermission).toMutableList()
+        // 每次操作都检查全部权限；通知拒绝后仍可继续，回调直接 prepare，避免申请循环。
+        if (Build.VERSION.SDK_INT >= 33 && !hasPermission(POST_NOTIFICATIONS)) {
             missing += POST_NOTIFICATIONS
         }
-        if (missing.isNotEmpty()) {
-            numberAwaitingPermissions = number
-            if (POST_NOTIFICATIONS in missing) {
-                notificationPermissionRequested = true
-            }
+        if (missing.isEmpty()) prepare(request)
+        else {
+            pendingRequest = request
             runCatching { permissionLauncher.launch(missing.toTypedArray()) }.onFailure {
-                numberAwaitingPermissions = null
-                showToast("无法申请拨号权限：${it.message}")
+                pendingRequest = null
+                showToast("无法申请权限：${it.message}")
             }
-            return
-        }
-        if (!CallAccessibilityService.isConnected) {
-            runCatching {
-                startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
-            }.onFailure {
-                Log.e(TAG, "dial: 无法打开无障碍设置", it)
-                showToast("无法打开无障碍设置")
-            }
-            return
-        }
-        adapter.releasePlayer()
-        val sessionToken = UUID.randomUUID().toString()
-        preparingSessionToken = sessionToken
-        // 只处理最新一次请求，忽略旧请求的延迟回调。
-        awaitingResultToken = sessionToken
-
-        Log.d(TAG, "dial: 正在启动录音前台服务, number = $number, sessionToken=$sessionToken")
-        runCatching {
-            CallSessionService.prepareSession(
-                context = this,
-                number = number,
-                sessionToken = sessionToken,
-                preparationReceiver = CallSessionPreparationReceiver(this, sessionToken, number),
-                completionReceiver = CallSessionCompletionReceiver(this),
-            )
-        }.onFailure {
-            preparingSessionToken = null
-            Log.e(TAG, "dial: 启动录音前台服务失败, number = $number, sessionToken=$sessionToken", it)
-            onCallSessionCompletionResult(CallSessionResult(
-                sessionToken, number, CallSessionResult.Outcome.FAILED,
-                errorMessage = "无法启动录音服务：${it.message}",
-            ))
         }
     }
 
-    private fun cancelWaitingSession(sessionToken: String) {
-        Log.d(TAG, "cancelWaitingSession: sessionToken=$sessionToken")
-        runCatching {
-            CallSessionService.cancelWaitingSession(this, sessionToken)
-        }.onFailure {
-            Log.e(TAG, "无法取消等待拨号的会话 sessionToken=$sessionToken", it)
+    private fun prepare(request: Request) {
+        if (RecordingService.hasSession || preparingId != null) return
+        if (request.source == CallSource.SYSTEM && !CallAccessibilityService.isConnected) {
+            runCatching { startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) }
+                .onFailure { showToast("无法打开无障碍设置") }
+            return
         }
+        adapter.releasePlayer()
+        val id = UUID.randomUUID().toString()
+        preparingId = id
+        awaitingId = id
+        activeRequest = request
+        runCatching { RecordingService.prepare(this, id, request.source, request.phoneNumber, EventReceiver(this)) }
+            .onFailure {
+                preparingId = null
+                awaitingId = null
+                activeRequest = null
+                showToast("无法准备录音：${it.message}")
+            }
+    }
+
+    private fun onRecordingEvent(result: RecordingResult) {
+        if (result.recordingId != awaitingId) return
+        val request = activeRequest
+        when (result.event) {
+            RecordingResult.Event.READY -> {
+                preparingId = null
+                if (!lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED) || request == null) {
+                    runCatching { RecordingService.cancelPreparation(this, result.recordingId) }
+                    return
+                }
+                runCatching {
+                    if (request.source == CallSource.SYSTEM) {
+                        startActivity(Intent(Intent.ACTION_CALL, Uri.fromParts("tel", request.phoneNumber, null)))
+                    } else {
+                        RecordingService.start(this, result.recordingId)
+                    }
+                }.onFailure {
+                    runCatching { RecordingService.cancelPreparation(this, result.recordingId) }
+                    showToast("无法开始通话录音：${it.message}")
+                }
+            }
+            RecordingResult.Event.STARTED -> Unit
+            else -> {
+                preparingId = null
+                awaitingId = null
+                activeRequest = null
+                showToast(when (result.event) {
+                    RecordingResult.Event.COMPLETED -> "录音已保存，可随时更新通话时长"
+                    RecordingResult.Event.CANCELLED -> result.errorMessage ?: "录音会话已取消"
+                    else -> result.errorMessage ?: "录音失败"
+                })
+            }
+        }
+        refreshRecordings()
+    }
+
+    @SuppressLint("SetTextI18n") // 编辑值使用与 toLongOrNull 一致的整数格式。
+    private fun editDuration(entry: RecordingEntry) {
+        val input = EditText(this).apply {
+            inputType = InputType.TYPE_CLASS_NUMBER
+            hint = "通话时长（秒）"
+            setText(entry.durationSeconds?.toString().orEmpty())
+        }
+        val dialog = AlertDialog.Builder(this).setTitle("更新通话时长").setView(input)
+            .setMessage("此时长用于文件名，不代表音频长度。")
+            .setNegativeButton("取消", null).setPositiveButton("保存", null).create()
+        dialog.setOnShowListener {
+            dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+                val seconds = input.text.toString().toLongOrNull()
+                if (seconds == null || seconds < 0) {
+                    input.error = "请输入大于等于零的整数"
+                    return@setOnClickListener
+                }
+                adapter.releasePlayer()
+                runCatching { RecordingStore.updateDuration(this, entry.recordingId, seconds) }
+                    .onSuccess { refreshRecordings(); dialog.dismiss() }
+                    .onFailure { input.error = it.message }
+            }
+        }
+        dialog.show()
+    }
+
+    private fun refreshRecordings() {
+        runCatching { adapter.update(RecordingStore.loadEntries(this)) }
+            .onFailure { showToast("无法读取录音：${it.message}") }
+        val session = RecordingService.session
+        binding.sessionStatus.text = when (session?.phase) {
+            RecordingService.Phase.RECORDING -> "正在录音：${session.phoneNumber}"
+            RecordingService.Phase.READY -> "等待通话或开始录音"
+            RecordingService.Phase.PREPARING -> "正在准备"
+            RecordingService.Phase.STOPPING -> "正在保存"
+            null -> "当前没有录音会话"
+        }
+        binding.stopButton.isEnabled = session != null
+        binding.dialButton.isEnabled = session == null && preparingId == null
     }
 
     override fun onResume() {
         super.onResume()
-        Log.d(TAG, "onResume: preparingSessionToken=$preparingSessionToken")
-        handler.removeCallbacks(refreshRecordingsTask)
-        handler.post(refreshRecordingsTask)
+        handler.removeCallbacks(refresh)
+        handler.post(refresh)
     }
 
     override fun onPause() {
-        Log.d(TAG, "onPause: preparingSessionToken=$preparingSessionToken")
-        handler.removeCallbacks(refreshRecordingsTask)
+        handler.removeCallbacks(refresh)
         adapter.releasePlayer()
         super.onPause()
     }
 
     override fun onSaveInstanceState(outState: Bundle) {
-        outState.putString("numberAwaitingPermissions", numberAwaitingPermissions)
-        outState.putBoolean("notificationPermissionRequested", notificationPermissionRequested)
+        pendingRequest?.let {
+            outState.putString("pendingSource", it.source.name)
+            outState.putString("pendingPhoneNumber", it.phoneNumber)
+        }
         super.onSaveInstanceState(outState)
     }
 
     override fun onDestroy() {
-        Log.d(TAG, "onDestroy: preparingSessionToken=$preparingSessionToken")
-        // 页面销毁时，取消尚未收到准备回调的会话；服务只清理匹配且仍在等待通话的会话。
-        preparingSessionToken?.let { cancelWaitingSession(it) }
-        preparingSessionToken = null
-        awaitingResultToken = null
+        preparingId?.let { runCatching { RecordingService.cancelPreparation(this, it) } }
         adapter.releasePlayer()
         binding.recordingList.adapter = null
         super.onDestroy()
     }
 
-    private fun showToast(text: String) = Toast.makeText(this, text, Toast.LENGTH_LONG).show()
-
+    private fun showToast(message: String) = Toast.makeText(this, message, Toast.LENGTH_LONG).show()
 }

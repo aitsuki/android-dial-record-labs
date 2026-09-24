@@ -8,23 +8,23 @@ import android.view.ViewGroup
 import android.widget.Toast
 import androidx.recyclerview.widget.RecyclerView
 import com.aitsuki.labs.dialrecord.data.RecordingEntry
+import com.aitsuki.labs.dialrecord.data.CallSource
+import com.aitsuki.labs.dialrecord.data.RecordingStore
 import com.aitsuki.labs.dialrecord.databinding.ItemRecordingBinding
-import com.aitsuki.labs.dialrecord.recording.CallSessionService
+import com.aitsuki.labs.dialrecord.recording.RecordingService
 import java.io.File
 import java.text.DateFormat
 import java.util.Date
 
-class RecordingAdapter : RecyclerView.Adapter<RecordingAdapter.Holder>() {
-    private var files = emptyList<File>()
+class RecordingAdapter(private val onEditDuration: (RecordingEntry) -> Unit) : RecyclerView.Adapter<RecordingAdapter.Holder>() {
     private var entries = emptyList<RecordingEntry>()
     private var player: MediaPlayer? = null
 
     class Holder(val binding: ItemRecordingBinding) : RecyclerView.ViewHolder(binding.root)
 
     @SuppressLint("NotifyDataSetChanged")
-    fun update(newFiles: List<File>, newEntries: List<RecordingEntry>) {
-        if (files == newFiles && entries == newEntries) return
-        files = newFiles
+    fun update(newEntries: List<RecordingEntry>) {
+        if (entries == newEntries) return
         entries = newEntries
         notifyDataSetChanged()
     }
@@ -32,30 +32,32 @@ class RecordingAdapter : RecyclerView.Adapter<RecordingAdapter.Holder>() {
     override fun onCreateViewHolder(parent: ViewGroup, viewType: Int) =
         Holder(ItemRecordingBinding.inflate(LayoutInflater.from(parent.context), parent, false))
 
-    override fun getItemCount() = files.size
+    override fun getItemCount() = entries.size
 
     @SuppressLint("SetTextI18n")
     override fun onBindViewHolder(holder: Holder, position: Int) {
-        val file = files[position]
-        val entry = entries.find { it.fileName == file.name }
-        val callLog = entry?.callLog
+        val entry = entries[position]
         holder.binding.apply {
-            fileName.text = file.name
-            callLogId.text =
-                if (callLog != null) "通话记录 ID：${callLog.id}" else "未关联通话记录"
-            phoneNumber.text = "号码：${entry?.phoneNumber ?: file.name.substringBefore('_')}"
-            recordingStartTime.text = entry?.let {
-                "录音开始：${DateFormat.getDateTimeInstance().format(Date(it.recordingStartedAtMs))}"
-            }.orEmpty()
-            callDuration.text =
-                if (callLog != null) "通话时长：${callLog.durationSeconds} 秒 · 点击播放" else "通话时长：未关联 · 点击播放"
-            root.setOnClickListener { play(it.context.applicationContext, file) }
+            fileName.text = entry.fileName
+            callLogId.text = when (entry.source) {
+                CallSource.SYSTEM -> entry.callLogId?.let { "系统电话 · 通话记录 ID：$it" } ?: "系统电话 · 尚未关联通话记录"
+                CallSource.SDK -> "SDK 通话"
+            }
+            phoneNumber.text = "电话号码：${entry.phoneNumber}"
+            recordingStartTime.text = "录音开始：${DateFormat.getDateTimeInstance().format(Date(entry.recordingStartedAtMs))}"
+            callDuration.text = "通话时长：${entry.durationSeconds?.let { "$it 秒" } ?: "未知"} · 点击播放"
+            editDuration.setOnClickListener { onEditDuration(entry) }
+            root.setOnClickListener {
+                runCatching { RecordingStore.audioFile(it.context, entry.recordingId) }
+                    .onSuccess { file -> play(root.context.applicationContext, file) }
+                    .onFailure { error -> showToast(root.context, error.message.orEmpty()) }
+            }
         }
     }
 
     private fun play(context: Context, file: File) {
         // 录音尚未封装完成时不能播放，也避免播放音频干扰通话录音。
-        if (CallSessionService.hasSession) {
+        if (RecordingService.hasSession) {
             showToast(context, "请在通话结束后播放录音")
             return
         }
@@ -66,7 +68,7 @@ class RecordingAdapter : RecyclerView.Adapter<RecordingAdapter.Holder>() {
             media.setDataSource(file.absolutePath)
             media.setOnPreparedListener { prepared ->
                 if (player !== prepared) return@setOnPreparedListener
-                if (CallSessionService.hasSession) {
+                if (RecordingService.hasSession) {
                     releasePlayer()
                     showToast(context, "请在通话结束后播放录音")
                     return@setOnPreparedListener

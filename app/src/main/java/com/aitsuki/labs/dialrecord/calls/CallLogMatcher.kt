@@ -1,4 +1,4 @@
-package com.aitsuki.labs.dialrecord.calllog
+package com.aitsuki.labs.dialrecord.calls
 
 import android.content.Context
 import android.database.ContentObserver
@@ -74,7 +74,7 @@ class CallLogMatcher(
 
     @Suppress("DEPRECATION")
     private fun findMatch(): CallLogInfo? {
-        val linkedCallLogIds = RecordingStore.loadEntries(context).mapNotNull { it.callLog?.id }.toSet()
+        val linkedCallLogIds = RecordingStore.loadEntries(context).mapNotNull { it.callLogId }.toSet()
         val matches = mutableListOf<CallLogInfo>()
         resolver.query(
             CallLog.Calls.CONTENT_URI,

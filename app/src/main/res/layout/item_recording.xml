@@ -48,6 +48,13 @@
             android:layout_height="wrap_content"
             tools:text="duration: 22s" />
 
+        <Button
+            android:id="@+id/edit_duration"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="修改通话时长"
+            tools:ignore="HardcodedText" />
+
     </LinearLayout>
 
 </com.google.android.material.card.MaterialCardView>
