@@ -21,19 +21,25 @@ import com.aitsuki.labs.dialrecord.data.RecordingStore
 import com.aitsuki.labs.dialrecord.ui.MainActivity
 import java.io.File
 
+
 class CallSessionService : Service() {
     companion object {
-        const val ACTION_PREPARE_SESSION = "com.aitsuki.labs.dialrecord.PREPARE_SESSION"
-        const val ACTION_CANCEL_WAITING_SESSION =
-            "com.aitsuki.labs.dialrecord.CANCEL_WAITING_SESSION"
-        const val EXTRA_NUMBER = "number"
-        const val EXTRA_PREPARATION_RECEIVER = "preparationReceiver"
-        const val EXTRA_SESSION_TOKEN = "sessionToken"
-        const val EXTRA_ERROR_MESSAGE = "errorMessage"
-        const val RESULT_SESSION_READY = 1
-        const val RESULT_SESSION_PREPARATION_FAILED = 0
-        private const val NOTIFICATION_CHANNEL_ID = "recording"
         private const val TAG = "CallSessionService"
+        private const val NOTIFICATION_CHANNEL_ID = "recording"
+
+        private const val ACTION_PREPARE_SESSION = "com.aitsuki.labs.dialrecord.PREPARE_SESSION"
+        private const val ACTION_CANCEL_WAITING_SESSION =
+            "com.aitsuki.labs.dialrecord.CANCEL_WAITING_SESSION"
+
+        private const val EXTRA_COMPLETION_RECEIVER = "completionReceiver"
+        private const val EXTRA_NUMBER = "number"
+        private const val EXTRA_PREPARATION_RECEIVER = "preparationReceiver"
+        private const val EXTRA_SESSION_TOKEN = "sessionToken"
+
+        const val EXTRA_ERROR_MESSAGE = "errorMessage"
+        const val RESULT_SESSION_PREPARATION_FAILED = 0
+        const val RESULT_SESSION_READY = 1
+        const val RESULT_SESSION_FINISHED = 2
 
         // UI 和服务共享同一个状态源，外部只能读取派生能力。
         private val session = CallSession()
@@ -43,9 +49,38 @@ class CallSessionService : Service() {
 
         val hasSession: Boolean
             get() = session.hasSession
+
+        /** 建立前台服务和电话监听；调用方收到准备成功后再拨号。启动异常交由调用方处理。 */
+        fun prepareSession(
+            context: Context,
+            number: String,
+            sessionToken: String,
+            preparationReceiver: ResultReceiver,
+            completionReceiver: ResultReceiver,
+        ) {
+            ContextCompat.startForegroundService(
+                context, Intent(context, CallSessionService::class.java)
+                    .setAction(ACTION_PREPARE_SESSION)
+                    .putExtra(EXTRA_NUMBER, number)
+                    .putExtra(EXTRA_SESSION_TOKEN, sessionToken)
+                    .putExtra(EXTRA_PREPARATION_RECEIVER, preparationReceiver)
+                    .putExtra(EXTRA_COMPLETION_RECEIVER, completionReceiver)
+            )
+        }
+
+        /** 仅取消 token 匹配且仍在等待拨号的会话，不中断通话或录音收尾。 */
+        fun cancelWaitingSession(context: Context, sessionToken: String) {
+            context.startService(
+                Intent(context, CallSessionService::class.java)
+                    .setAction(ACTION_CANCEL_WAITING_SESSION)
+                    .putExtra(EXTRA_SESSION_TOKEN, sessionToken)
+            )
+        }
     }
 
     private val handler = Handler(Looper.getMainLooper())
+    private var completionReceiver: ResultReceiver? = null
+    private var recordingError: String? = null
     private var number: String? = null
     private var sessionToken: String? = null
     private var dialRequestedAtMs = 0L
@@ -56,7 +91,7 @@ class CallSessionService : Service() {
     private val offHookTimeout = Runnable {
         if (session.isWaitingForOffHook) {
             Log.w(TAG, "等待 OFFHOOK 超时，结束会话 number=$number, sessionToken=$sessionToken")
-            endSessionAndStopService()
+            endSessionAndStopService(CallSessionResult.Outcome.TIMED_OUT, error = "等待拨号超时")
         }
     }
     private val phoneStateReceiver = object : BroadcastReceiver() {
@@ -117,7 +152,7 @@ class CallSessionService : Service() {
                     TAG,
                     "onStartCommand: 取消等待拨号的会话 number=$number, sessionToken=$sessionToken"
                 )
-                endSessionAndStopService()
+                endSessionAndStopService(CallSessionResult.Outcome.CANCELLED)
             } else {
                 Log.d(
                     TAG,
@@ -135,6 +170,16 @@ class CallSessionService : Service() {
                 ResultReceiver::class.java
             )
         }
+        val requestedReceiver = intent?.let {
+            IntentCompat.getParcelableExtra(it, EXTRA_COMPLETION_RECEIVER, ResultReceiver::class.java)
+        }
+        fun rejectRequest(message: String?) {
+            val token = intent?.getStringExtra(EXTRA_SESSION_TOKEN) ?: return
+            sendCompletion(requestedReceiver, CallSessionResult(
+                token, intent.getStringExtra(EXTRA_NUMBER).orEmpty(),
+                CallSessionResult.Outcome.FAILED, errorMessage = message,
+            ))
+        }
         if (intent?.action != ACTION_PREPARE_SESSION || !session.canStartDial) {
             Log.w(
                 TAG,
@@ -143,6 +188,7 @@ class CallSessionService : Service() {
             preparationReceiver?.send(RESULT_SESSION_PREPARATION_FAILED, Bundle().apply {
                 putString(EXTRA_ERROR_MESSAGE, "正在通话或处理录音，请稍后再试")
             })
+            rejectRequest("正在通话或处理录音，请稍后再试")
             if (!session.hasSession) stopSelf()
             return START_NOT_STICKY
         }
@@ -159,18 +205,20 @@ class CallSessionService : Service() {
             preparationReceiver?.send(RESULT_SESSION_PREPARATION_FAILED, Bundle().apply {
                 putString(EXTRA_ERROR_MESSAGE, e.message)
             })
+            rejectRequest(e.message)
             if (!session.hasSession) stopSelf()
             return START_NOT_STICKY
         }
         try {
             if (session.isWaitingForOffHook) {
                 Log.d(TAG, "替换尚未开始通话的会话 sessionToken=$sessionToken")
-                releaseSessionResources()
+                finishSession(CallSessionResult.Outcome.CANCELLED, error = "被新的拨号请求替换")
             }
+            completionReceiver = requestedReceiver
+            number = requestedNumber
             sessionToken = requestedToken
             updateForegroundNotification("等待本 App 发起的通话")
             traceSessionTransition("新拨号请求") { session.begin() }
-            number = requestedNumber
             dialRequestedAtMs = System.currentTimeMillis()
             ContextCompat.registerReceiver(
                 this,
@@ -191,7 +239,7 @@ class CallSessionService : Service() {
             preparationReceiver?.send(RESULT_SESSION_PREPARATION_FAILED, Bundle().apply {
                 putString(EXTRA_ERROR_MESSAGE, e.message)
             })
-            endSessionAndStopService()
+            endSessionAndStopService(CallSessionResult.Outcome.FAILED, error = e.message)
         }
         return START_NOT_STICKY
     }
@@ -235,6 +283,7 @@ class CallSessionService : Service() {
             Log.d(TAG, "startRecording: 录音已启动 file=${entry.fileName}")
             updateForegroundNotification("通话录音中，挂断后自动保存")
         } catch (e: Exception) {
+            recordingError = "无法启动录音：${e.message}"
             Log.e(TAG, "无法启动录音", e)
             recorder?.release()
             recorder = null
@@ -255,6 +304,7 @@ class CallSessionService : Service() {
             media.stop()
             true
         } catch (e: RuntimeException) {
+            recordingError = "录音未生成有效音频：${e.message}"
             Log.w(TAG, "录音未生成有效音频", e)
             false
         } finally {
@@ -272,12 +322,18 @@ class CallSessionService : Service() {
             val entry = stopRecording()
             if (entry == null) {
                 Log.d(TAG, "finalizeSession: 没有有效录音，跳过关联 sessionToken=$sessionToken")
-                endSessionAndStopService()
+                endSessionAndStopService(
+                    if (recordingError != null) CallSessionResult.Outcome.FAILED
+                    else CallSessionResult.Outcome.CANCELLED,
+                    error = recordingError,
+                )
                 return
             }
             updateForegroundNotification("录音已保存，正在关联系统通话记录")
             callLogMatcher = CallLogMatcher(this, entry, dialRequestedAtMs) { callLog ->
                 Log.d(TAG, "finalizeSession: 关联完成 file=${entry.fileName}, callLog=$callLog")
+                var finalEntry = entry
+                var finalError: String? = null
                 if (callLog != null) {
                     try {
                         val matched = entry.copy(callLog = callLog)
@@ -285,21 +341,27 @@ class CallSessionService : Service() {
                         val source = File(directory, entry.fileName)
                         val target = File(directory, matched.fileName)
                         check(!target.exists() && source.renameTo(target)) { "录音文件重命名失败" }
+                        finalEntry = matched
                         RecordingStore.saveMetadata(this, matched)
                         Log.d(
                             TAG,
                             "finalizeSession: 重命名成功 ${source.name} -> ${target.name}, callId=${callLog.id}"
                         )
                     } catch (e: Exception) {
+                        finalError = "无法保存通话关联结果：${e.message}"
                         Log.e(TAG, "无法保存通话关联结果", e)
                     }
                 }
-                endSessionAndStopService()
+                endSessionAndStopService(
+                    if (finalError == null) CallSessionResult.Outcome.COMPLETED
+                    else CallSessionResult.Outcome.FAILED,
+                    finalEntry, finalError,
+                )
             }
             callLogMatcher!!.start()
         } catch (e: Exception) {
             Log.e(TAG, "无法关联本次通话记录", e)
-            endSessionAndStopService()
+            endSessionAndStopService(CallSessionResult.Outcome.FAILED, error = e.message)
         }
     }
 
@@ -314,10 +376,33 @@ class CallSessionService : Service() {
     }
 
     /** 释放会话资源并停止服务，用于完成、取消、超时或失败。 */
-    private fun endSessionAndStopService() {
-        Log.d(TAG, "endSessionAndStopService: sessionToken=$sessionToken, state=${session.state}")
-        releaseSessionResources()
+    private fun endSessionAndStopService(
+        outcome: CallSessionResult.Outcome,
+        entry: RecordingEntry? = null,
+        error: String? = null,
+    ) {
+        finishSession(outcome, entry, error)
         stopSelf()
+    }
+
+    private fun finishSession(
+        outcome: CallSessionResult.Outcome,
+        entry: RecordingEntry? = null,
+        error: String? = null,
+    ) {
+        val receiver = completionReceiver
+        val result = sessionToken?.let {
+            CallSessionResult(it, number.orEmpty(), outcome, entry, error)
+        }
+        // 清理前取快照，清理后投递，确保回调时服务已恢复空闲。
+        completionReceiver = null
+        releaseSessionResources()
+        if (result != null) sendCompletion(receiver, result)
+    }
+
+    private fun sendCompletion(receiver: ResultReceiver?, result: CallSessionResult) {
+        runCatching { receiver?.send(RESULT_SESSION_FINISHED, result.toBundle()) }
+            .onFailure { Log.w(TAG, "无法投递会话结果 sessionToken=${result.sessionToken}", it) }
     }
 
     /** 仅释放资源并恢复空闲；替换等待请求时仍复用当前服务。 */
@@ -352,6 +437,7 @@ class CallSessionService : Service() {
         }
         traceSessionTransition("资源清理完成") { session.reset() }
         sessionToken = null
+        recordingError = null
     }
 
     private inline fun <T> traceSessionTransition(reason: String, action: () -> T): T {
@@ -368,7 +454,7 @@ class CallSessionService : Service() {
 
     override fun onDestroy() {
         Log.d(TAG, "onDestroy: number=$number, sessionToken=$sessionToken")
-        releaseSessionResources()
+        finishSession(CallSessionResult.Outcome.FAILED, error = "录音服务已停止")
         super.onDestroy()
     }
 }

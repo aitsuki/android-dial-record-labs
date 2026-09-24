@@ -28,6 +28,8 @@ import com.aitsuki.labs.dialrecord.accessibility.CallAccessibilityService
 import com.aitsuki.labs.dialrecord.data.RecordingStore
 import com.aitsuki.labs.dialrecord.databinding.ActivityMainBinding
 import com.aitsuki.labs.dialrecord.recording.CallSessionService
+import com.aitsuki.labs.dialrecord.recording.CallSessionResult
+import java.lang.ref.WeakReference
 import java.util.UUID
 
 private const val TAG = "MainActivity"
@@ -42,6 +44,103 @@ class MainActivity : AppCompatActivity() {
     private var preparingSessionToken: String? = null // 等待服务准备完成，尚未打开系统拨号界面。
     private val handler = Handler(Looper.getMainLooper())
     private val adapter = RecordingAdapter()
+    private var awaitingResultToken: String? = null
+
+    // 静态嵌套类，只弱引用发起请求的页面，避免服务持有已销毁的 Activity。
+    private class CallSessionPreparationReceiver(
+        activity: MainActivity,
+        private val sessionToken: String,
+        private val number: String,
+    ) : ResultReceiver(Handler(Looper.getMainLooper())) {
+        private val owner = WeakReference(activity)
+
+        override fun onReceiveResult(resultCode: Int, resultData: Bundle?) {
+            val activity = owner.get() ?: return
+            if (activity.isFinishing || activity.isDestroyed) return
+            activity.onCallSessionPreparationResult(sessionToken, number, resultCode, resultData)
+        }
+    }
+
+    // 静态嵌套类，只弱引用发起请求的页面，避免服务持有已销毁的 Activity。
+    private class CallSessionCompletionReceiver(activity: MainActivity) :
+        ResultReceiver(Handler(Looper.getMainLooper())) {
+        private val owner = WeakReference(activity)
+
+        override fun onReceiveResult(resultCode: Int, resultData: Bundle?) {
+            if (resultCode != CallSessionService.RESULT_SESSION_FINISHED || resultData == null) return
+            val activity = owner.get() ?: return
+            if (activity.isFinishing || activity.isDestroyed) return
+            val result = runCatching { CallSessionResult.fromBundle(resultData) }
+                .getOrElse {
+                    Log.w(TAG, "无法解析会话结果", it)
+                    return
+                }
+            activity.onCallSessionCompletionResult(result)
+        }
+    }
+
+    /** 处理通话会话准备结果，校验当前请求和页面状态后发起拨号。 */
+    private fun onCallSessionPreparationResult(
+        sessionToken: String,
+        number: String,
+        resultCode: Int,
+        resultData: Bundle?,
+    ) {
+        Log.d(
+            TAG,
+            "onReceiveResult: resultCode=$resultCode, preparingSessionToken=$preparingSessionToken, sessionToken=$sessionToken"
+        )
+        if (preparingSessionToken != sessionToken) {
+            Log.w(TAG, "onReceiveResult: 忽略非当前准备会话的回调 sessionToken=$sessionToken")
+            return
+        }
+        preparingSessionToken = null
+        if (resultCode != CallSessionService.RESULT_SESSION_READY) {
+            val errorMessage =
+                resultData?.getString(CallSessionService.EXTRA_ERROR_MESSAGE) ?: "无法启动录音服务"
+            Log.w(TAG, "onReceiveResult: 服务启动失败，sessionToken=$sessionToken, error=$errorMessage")
+            // 失败提示由独立的完成回调统一处理。
+            return
+        }
+
+        if (!lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) {
+            Log.w(TAG, "onReceiveResult: 服务准备期间离开页面，取消等待会话 sessionToken=$sessionToken")
+            cancelWaitingSession(sessionToken)
+            return
+        }
+        runCatching {
+            Log.d(TAG, "onReceiveResult: 开始拨号 $number, sessionToken=$sessionToken")
+            startActivity(Intent(Intent.ACTION_CALL, Uri.fromParts("tel", number, null)))
+        }.onFailure {
+            Log.e(TAG, "onReceiveResult: 拨号失败 $number, sessionToken=$sessionToken", it)
+            cancelWaitingSession(sessionToken)
+            onCallSessionCompletionResult(CallSessionResult(
+                sessionToken, number, CallSessionResult.Outcome.FAILED,
+                errorMessage = "拨号失败：${it.message}",
+            ))
+        }
+    }
+
+    /** 接收通话会话终态，过滤过期或重复结果后交给业务回调。 */
+    private fun onCallSessionCompletionResult(result: CallSessionResult) {
+        if (awaitingResultToken != result.sessionToken) return
+        awaitingResultToken = null
+        onCallSessionFinished(result)
+    }
+
+    /** 仅向原页面交付结果；以后可在这里按 sessionToken 转发到 H5。 */
+    private fun onCallSessionFinished(result: CallSessionResult) {
+        Log.d(TAG, "会话结束：$result")
+        val message = when (result.outcome) {
+            CallSessionResult.Outcome.COMPLETED ->
+                if (result.recording?.callLog != null) "通话录音已保存，通话记录已关联"
+                else "通话录音已保存，未匹配到通话记录"
+            CallSessionResult.Outcome.CANCELLED -> "拨号会话已取消"
+            CallSessionResult.Outcome.TIMED_OUT -> "等待拨号超时"
+            CallSessionResult.Outcome.FAILED -> result.errorMessage ?: "拨号录音失败"
+        }
+        showToast(message)
+    }
 
     private val refreshRecordingsTask = object : Runnable {
         override fun run() {
@@ -155,65 +254,32 @@ class MainActivity : AppCompatActivity() {
         adapter.releasePlayer()
         val sessionToken = UUID.randomUUID().toString()
         preparingSessionToken = sessionToken
-        val preparationReceiver = object : ResultReceiver(handler) {
-            override fun onReceiveResult(resultCode: Int, resultData: Bundle?) {
-                Log.d(
-                    TAG,
-                    "onReceiveResult: resultCode=$resultCode, preparingSessionToken=$preparingSessionToken, sessionToken=$sessionToken"
-                )
-                if (preparingSessionToken != sessionToken) {
-                    Log.w(TAG, "onReceiveResult: 忽略非当前准备会话的回调 sessionToken=$sessionToken")
-                    return
-                }
-                preparingSessionToken = null
-                if (resultCode != CallSessionService.RESULT_SESSION_READY) {
-                    val errorMessage =
-                        resultData?.getString(CallSessionService.EXTRA_ERROR_MESSAGE) ?: "无法启动录音服务"
-                    Log.w(TAG, "onReceiveResult: 服务启动失败，sessionToken=$sessionToken, error=$errorMessage")
-                    showToast(errorMessage)
-                    return
-                }
-
-                if (!lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) {
-                    Log.w(TAG, "onReceiveResult: 服务准备期间离开页面，取消等待会话 sessionToken=$sessionToken")
-                    cancelWaitingSession(sessionToken)
-                    return
-                }
-                runCatching {
-                    Log.d(TAG, "onReceiveResult: 开始拨号 $number, sessionToken=$sessionToken")
-                    startActivity(Intent(Intent.ACTION_CALL, Uri.fromParts("tel", number, null)))
-                }.onFailure {
-                    Log.e(TAG, "onReceiveResult: 拨号失败 $number, sessionToken=$sessionToken", it)
-                    cancelWaitingSession(sessionToken)
-                    showToast("拨号失败：${it.message}")
-                }
-            }
-        }
+        // 只处理最新一次请求，忽略旧请求的延迟回调。
+        awaitingResultToken = sessionToken
 
         Log.d(TAG, "dial: 正在启动录音前台服务, number = $number, sessionToken=$sessionToken")
         runCatching {
-            ContextCompat.startForegroundService(
-                this, Intent(this, CallSessionService::class.java)
-                    .setAction(CallSessionService.ACTION_PREPARE_SESSION)
-                    .putExtra(CallSessionService.EXTRA_NUMBER, number)
-                    .putExtra(CallSessionService.EXTRA_SESSION_TOKEN, sessionToken)
-                    .putExtra(CallSessionService.EXTRA_PREPARATION_RECEIVER, preparationReceiver)
+            CallSessionService.prepareSession(
+                context = this,
+                number = number,
+                sessionToken = sessionToken,
+                preparationReceiver = CallSessionPreparationReceiver(this, sessionToken, number),
+                completionReceiver = CallSessionCompletionReceiver(this),
             )
         }.onFailure {
             preparingSessionToken = null
             Log.e(TAG, "dial: 启动录音前台服务失败, number = $number, sessionToken=$sessionToken", it)
-            showToast("无法启动录音服务：${it.message}")
+            onCallSessionCompletionResult(CallSessionResult(
+                sessionToken, number, CallSessionResult.Outcome.FAILED,
+                errorMessage = "无法启动录音服务：${it.message}",
+            ))
         }
     }
 
     private fun cancelWaitingSession(sessionToken: String) {
         Log.d(TAG, "cancelWaitingSession: sessionToken=$sessionToken")
         runCatching {
-            startService(
-                Intent(this, CallSessionService::class.java)
-                    .setAction(CallSessionService.ACTION_CANCEL_WAITING_SESSION)
-                    .putExtra(CallSessionService.EXTRA_SESSION_TOKEN, sessionToken)
-            )
+            CallSessionService.cancelWaitingSession(this, sessionToken)
         }.onFailure {
             Log.e(TAG, "无法取消等待拨号的会话 sessionToken=$sessionToken", it)
         }
@@ -244,6 +310,7 @@ class MainActivity : AppCompatActivity() {
         // 页面销毁时，取消尚未收到准备回调的会话；服务只清理匹配且仍在等待通话的会话。
         preparingSessionToken?.let { cancelWaitingSession(it) }
         preparingSessionToken = null
+        awaitingResultToken = null
         adapter.releasePlayer()
         binding.recordingList.adapter = null
         super.onDestroy()
