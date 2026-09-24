@@ -5,76 +5,48 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
-import android.os.Handler
-import android.os.Looper
+import android.net.Uri
 import android.telecom.TelecomManager
 import android.telephony.TelephonyManager
-import android.util.Log
 import androidx.core.content.ContextCompat
-import com.aitsuki.labs.dialrecord.data.RecordingEntry
-import com.aitsuki.labs.dialrecord.data.RecordingStore
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.withTimeout
 
-/** 系统电话独有的等待、监听和通话记录补全。不会被 SDK 会话使用。 */
-internal class SystemCallController(
-    context: Context,
-    private val onStarted: () -> Unit,
-    private val onEnded: () -> Unit,
-    private val onCancelled: (String) -> Unit,
-) {
-    private val context = context.applicationContext
-    private val handler = Handler(Looper.getMainLooper())
-    private var registered = false
-    private var active = false
-    var requestedAtMs = 0L
-        private set
-
-    private val timeout = Runnable { onCancelled("等待拨号超时") }
-    private val receiver = object : BroadcastReceiver() {
-        override fun onReceive(context: Context, intent: Intent) {
-            if (!registered) return
-            when (intent.getStringExtra(TelephonyManager.EXTRA_STATE)) {
-                TelephonyManager.EXTRA_STATE_OFFHOOK -> if (!active) {
-                    active = true
-                    handler.removeCallbacks(timeout)
-                    onStarted()
-                }
-                TelephonyManager.EXTRA_STATE_IDLE -> if (active) onEnded()
-                TelephonyManager.EXTRA_STATE_RINGING -> if (!active) onCancelled("来电中断了拨号等待")
-            }
-        }
-    }
+/** 一次系统拨号。只负责电话状态，不依赖录音服务；调用者取消时立即注销监听。 */
+object SystemCallController {
+    data class Window(val requestedAtMs: Long, val offhookAtMs: Long)
 
     @SuppressLint("MissingPermission")
-    fun prepare() {
+    suspend fun call(context: Context, number: String, onOffhook: () -> Unit): Window {
         check(!context.getSystemService(TelecomManager::class.java).isInCall) { "当前已有通话" }
-        requestedAtMs = System.currentTimeMillis()
-        ContextCompat.registerReceiver(
-            context, receiver, IntentFilter(TelephonyManager.ACTION_PHONE_STATE_CHANGED),
-            ContextCompat.RECEIVER_EXPORTED,
-        )
-        registered = true
-        handler.postDelayed(timeout, 90_000)
-    }
-
-    fun close() {
-        handler.removeCallbacks(timeout)
-        if (registered) {
-            registered = false
-            runCatching { context.unregisterReceiver(receiver) }
-                .onFailure { Log.w("SystemCallController", "无法注销电话监听", it) }
+        val states = Channel<String>(Channel.UNLIMITED)
+        val receiver = object : BroadcastReceiver() {
+            override fun onReceive(context: Context, intent: Intent) {
+                intent.getStringExtra(TelephonyManager.EXTRA_STATE)?.let { states.trySend(it) }
+            }
         }
-    }
-
-    companion object {
-        /** 可选的进程内补全，不占用录音会话；进程退出时允许保留未知时长。 */
-        fun enrich(context: Context, entry: RecordingEntry, requestedAtMs: Long) {
-            val app = context.applicationContext
-            CallLogMatcher(app, entry, requestedAtMs) { call ->
-                if (call != null) {
-                    runCatching { RecordingStore.attachCallLog(app, entry.recordingId, call) }
-                        .onFailure { Log.w("SystemCallController", "无法补全通话记录", it) }
+        ContextCompat.registerReceiver(context, receiver,
+            IntentFilter(TelephonyManager.ACTION_PHONE_STATE_CHANGED), ContextCompat.RECEIVER_EXPORTED)
+        try {
+            val requestedAt = System.currentTimeMillis()
+            context.startActivity(Intent(Intent.ACTION_CALL, Uri.fromParts("tel", number, null)))
+            // OFFHOOK 包含拨号阶段，不代表对方接听。尚未拨出时的初始 IDLE 要忽略。
+            withTimeout(90_000) {
+                var offhook = false
+                while (!offhook) {
+                    when (states.receive()) {
+                        TelephonyManager.EXTRA_STATE_OFFHOOK -> offhook = true
+                        TelephonyManager.EXTRA_STATE_RINGING -> error("来电中断了拨号等待")
+                    }
                 }
-            }.start()
+            }
+            val offhookAt = System.currentTimeMillis()
+            onOffhook()
+            while (states.receive() != TelephonyManager.EXTRA_STATE_IDLE) { /* 等待挂断 */ }
+            return Window(requestedAt, offhookAt)
+        } finally {
+            context.unregisterReceiver(receiver)
+            states.close()
         }
     }
 }

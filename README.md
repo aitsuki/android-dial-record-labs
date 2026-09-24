@@ -1,89 +1,114 @@
 # Dial Record Labs
 
-实验性 Android 通话录音 App。录音会话可以由系统电话事件、SDK 接入代码或手动操作驱动，不要求存在系统通话记录。
+用于改造混合 App 通话功能的技术预研，不是录音管理 App，也不复刻线上业务。
+
+## 验证三个场景
+
+1. **系统通话 · 录音**：准备麦克风前台服务 → 拨号 → OFFHOOK 开始录音 → IDLE 停止录音 → 查询本次系统通话记录 → 返回结果。
+2. **系统通话 · 不录音**：同样拨号、监听和查询记录，不绑定录音服务，不申请麦克风权限。
+3. **SDK 事件模拟 · 手动录音**：开始请求模拟开始录音，按钮模拟 SDK 通话结束，可输入 SDK 返回的通话时长。不监听系统电话，不查询系统记录。
+
+**没有接入 Infobip。第三种场景只验证录音生命周期和结果传递，不能证明能采集 Infobip 的双向音频。**
+
+页面分别展示 H5 回调 JSON 与 Android 本地录音/上传诊断，**不把文件地址回调给 H5**。`MainActivity.complete()` 是未来接 H5 回调的位置。预研页面生成 UUID 模拟 callId；移植时换成 H5 传入的原值。SDK 结果里的 `simulated` 等字段只是演示，不是完整线上协议。录音前填写关联用 userId（默认实验值 `lab`，线上应来自登录信息）。
 
 ## 代码结构
 
-- `recording/RecordingService.kt`：前台服务、录音生命周期、命令及结果。状态与事件放在同一文件，所有命令在主线程串行处理。
-- `calls/SystemCallController.kt`：系统电话的 OFFHOOK / IDLE 监听、拨号等待和超时。
-- `calls/CallLogMatcher.kt`：系统通话结束后的可选信息补全。
-- `data/RecordingEntry.kt`、`RecordingStore.kt`：录音信息、文件保存、时长更新与重命名恢复。
-- `ui/`：模式选择、系统拨号、手动录音验证、播放和时长编辑。
+- `ui/MainActivity.kt`：权限、单请求协程、流程编排、结果展示；不保存或恢复请求。
+- `calls/SystemCallController.kt`：一次系统拨号，等待 OFFHOOK / IDLE；在 finally 注销广播。
+- `calls/CallLogMatcher.kt`：独立查询通话记录，完全不依赖录音服务或文件。
+- `recording/RecordingService.kt`：绑定式麦克风前台服务，只有准备、开始、结束和资源清理；不负责电话状态或业务回调。
+- `recording/RecordingFiles.kt`：临时目录、文件名协议、重命名发布到待上传目录，无元数据存储。
+- `upload/RecordingUploader.kt`：独立串行轮询、失败重试、收到成功确认后删除文件。
+- `LabApplication.kt`：启动唯一的进程级上传协程；`uploadRecording()` 是替换真实网络请求的位置。
+- `accessibility/CallAccessibilityService.kt`：保留原有系统录音实验的无障碍服务前置检查。
 
-没有旧数据迁移逻辑，也没有 DurationSource。来源仅包含 SYSTEM 和 SDK，不代表已经集成了对应 SDK 的音频接口。
+删除了 RecordingEntry、RecordingStore、录音列表、播放器、手动修改历史时长、元数据及文件名恢复机制。使用已有依赖提供的协程和 lifecycleScope，没有新增依赖。
 
-所有拨打方式都必须提供 phoneNumber，不能使用空值或 SDK 用户标识。页面统一标准化号码，Service 和录音数据统一校验为可选的前导 `+` 加 1–32 位数字。
+## 一次请求的生命周期
 
-## 生命周期与接入
+- 同时只处理一次请求，callId 保存在不可变请求中，不会被后续点击覆盖。
+- `lifecycleScope` 跟随页面销毁取消。进入后台或打开系统电话界面不会取消请求。
+- 取消时注销电话监听、停止录音并解绑；不恢复会话、不向重建的页面补发回调。页面销毁不会挂断系统电话。
+- 录音服务在可见页面中准备，再发起系统拨号，以满足麦克风前台服务的启动限制。
+- 录音服务不自动重启。正常取消会尽力封装已经录制的音频；进程被直接杀死时不保证 finally/onDestroy 执行。
+- 拨号或 SDK 结果与录音结果分开。录音启动/封装/发布失败显示在 Android 本地诊断中，不提前结束通话等待，也不替换通话业务结果。准备服务失败则本次请求失败，不拨号。
+- 系统通话等待 OFFHOOK 最多 90 秒；通话进行中不强制超时。等待期间出现 RINGING 会结束本次请求。
+- OFFHOOK **不代表对方接听**，不能用于计算真实通话时长。SDK 模拟不以录音长度替代通话时长，留空为未知，0 为明确的零秒。
 
-为每个请求创建一个 UUID，作为整个录音生命周期和后续更新的稳定 ID：
+代码直接使用挂起流程，不建立通用事件总线、持久化状态机或会话恢复层。`withRecorder` 的 finally 保证调用者取消时释放录音资源。
 
-```kotlin
-val id = UUID.randomUUID().toString()
+## 系统通话记录匹配
 
-RecordingService.prepare(context, id, CallSource.SDK, "13800138000", receiver)
-// receiver 收到 READY 后，前台服务已建立。
-// 在需要开始采集的时机（例如 SDK 的通话事件）调用：
-RecordingService.start(context, id)
+拨号前查询最大记录 ID 作为水位。挂断后仅考虑：
 
-// SDK 通话结束；不知道通话时长时省略第三个参数。
-RecordingService.finish(context, id, durationSeconds = 56)
+- ID 大于拨号前水位；
+- 呼出记录；
+- 号码与本次号码匹配（PhoneNumberUtils.compare）；
+- 记录时间位于本次拨号到 OFFHOOK 的窗口内，前后容差 2 秒。
 
-// 保存完成之后，也可以独立修正时长与文件名。
-val updated = RecordingStore.updateDuration(context, id, 60)
-val audio = RecordingStore.audioFile(context, updated.recordingId)
+每 500 毫秒查询一次，最多等待约 10 秒（系统 Provider 单次查询耗时另计）。仅返回唯一候选；超时或多候选不猜测，不拿“最新一条”兜底。匹配失败返回明确错误，已完成的录音仍保留。
+
+这仍是设备相关的启发式匹配，不是 Android 提供的通话 ID 关联保证。多 SIM、其他应用同时拨号、厂商记录时间差异需要真机测试。通话记录中的 date 为毫秒、duration 为秒。
+
+## 文件名就是关联协议
+
+线上参考代码使用 `<userId>_<phoneNumber>_<callTime秒>_<duration秒>.mp3`。本项目沿用字段顺序，但实际编码为 AAC/MPEG-4，因此使用 **`.m4a`**，不能只修改扩展名伪装成 MP3。后端是否接受 m4a 仍需联调确认。
+
+- `userId`：一次请求开始时固定，不能在上传时用新的登录用户覆盖。
+- `phoneNumber`：与业务回调里的 number 使用同一份标准化号码。
+- `callTime`：沿用线上有录音时的约定，取录音开始时间；无录音开始时间时取系统记录时间或模拟 SDK 开始时间。业务回调 `date` 为秒精度的毫秒时间戳，文件名为 `date / 1000`。
+- 系统记录原始时间另放在 `callLog.systemDate`，不能误用它代替关联用的 `date`。
+- `duration`：系统记录/SDK 结果的通话时长，不是音频长度；明确的 0 可以发布，未知不伪造为 0。这里不沿用旧 App 静默删除零秒音频的策略。
+
+例如：回调 number 为 `+244123456`、date 为 `1700000000000`、duration 为 `42`，userId 为 `123`，则文件名为 `123_+244123456_1700000000_42.m4a`。UUID 只用于临时文件与模拟 callId，不能擅自加入最终协议文件名。
+
+## 文件发布与独立轮询
+
+```text
+recordings/staging/<UUID>.part       录制中，不能上传
+recordings/staging/<UUID>.m4a        已封装，但尚未发布，不能上传
+recordings/pending/<协议文件名>.m4a   关联字段完整，等待上传
 ```
 
-`ResultReceiver` 使用主线程 Handler；通过 `RecordingResult.fromBundle(bundle)` 解析事件：
+- 挂断后立即封装；拿到关联字段后，先按协议命名并移入 pending，再返回通话结果。回调不等待网络上传。
+- staging 与 pending 在同一文件系统，通过一次 rename 发布，轮询不会看到半成品。
+- 记录匹配失败、时长未知、页面中途销毁：保留 staging 文件，不上传、不恢复旧会话。发布失败也保留原文件。同名冲突报错，不覆盖、不自行加后缀。
+- pending 文件名从发布到重试始终不变；目录本身就是队列，没有 entry.json 或数据库。
+- Application 启动时扫描一次，之后每轮结束等待 60 秒；逐个上传。一个文件失败不阻塞其他文件。
+- 只有网络适配器返回业务成功确认才删除文件。失败、超时、取消都保留文件。进程退出后轮询停止，下次启动重新扫描 pending；与 Activity/H5 生命周期无关。
+- 这是“至少一次”尝试，不是“恰好一次”。服务器收到文件但响应丢失，或本地删除失败，都会导致同名重试；服务端需要按约定处理幂等，客户端不能单方面保证。
+- **当前没有接入真实服务器。** `LabApplication.uploadRecording()` 只打印待上传文件名并返回 false，绝不模拟成功删除文件。实现真实上传时，保留 multipart 的 `filename = file.name`，补充认证、网络超时与取消支持；返回 true 必须代表业务确认成功，不只是 HTTP 请求发出了。
+- 不使用 WorkManager、不另建上传前台服务、不为上传延长录音服务生命周期。后台协程不保证精确定时或抵抗系统休眠/杀进程。
+- 不迁移或恢复旧版录音。staging 中遗留文件不自动补关联，实验后可清除 App 数据。
 
-- `READY`：服务就绪，还没有开始录音。
-- `STARTED`：录音器成功启动。
-- `COMPLETED`：音频已封装并保存，结果包含录音信息；不表示电话一定接通过。
-- `CANCELLED`：准备被取消，或未开始录音便结束。
-- `FAILED`：准备、录音或保存失败，附错误信息。异常关闭时若成功保存音频，结果仍会携带该录音。
+可通过 Android Studio Device Explorer 导出 staging/pending 中的 `.m4a` 试听。不再提供 App 内播放列表。
 
-同一时间只允许一个录音会话；已有会话时拒绝新的准备请求，不替换当前会话。重复开始、结束，以及其他 ID 的过期命令不会重复录音或中断当前录音。
+## 权限和音频限制
 
-准备阶段可调用 `cancelPreparation(context, id)`。录音开始后取消准备不会停止录音，必须调用 `finish`。录音期间可用 `setDuration(context, id, seconds)` 暂存时长；已完成录音使用 Store 更新。事件只在内存中投递，页面销毁后通过 Store 重读已保存录音；服务不会在进程被杀后自动恢复采集。
+系统通话需要 CALL_PHONE、READ_PHONE_STATE、READ_CALL_LOG；录音另外需要 RECORD_AUDIO。SDK 模拟仅需要麦克风。Android 13+ 录音时可申请通知权限，拒绝不阻止操作。
 
-## 不同来源
+系统录音保留无障碍服务前置检查，不录音和 SDK 模拟不要求开启。无障碍服务本身不等于获得系统双向音频权限。
 
-### 系统电话
-
-选择 SYSTEM。页面准备服务后发起 ACTION_CALL；Controller 收到 OFFHOOK 时开始录音，IDLE 时停止。等待 OFFHOOK 最多 90 秒，等待时收到来电则取消。
-
-文件保存后立即结束录音会话，通话记录匹配最多继续尝试 10 秒。匹配只补充未知时长，不覆盖已经传入或手动编辑的时长。不允许两条录音关联同一条通话记录。匹配是进程内的可选补全，进程退出、匹配失败或权限在会话开始后被撤销时可以保留未知时长。
-
-系统模式保留原有无障碍服务前置检查。
-
-### SDK 通话
-
-选择 SDK，使用显式 start / finish，不注册系统电话监听，也不查询系统通话记录。
-
-当前页面的 SDK 模式是通用录音的手动验证入口，项目未接入 Infobip SDK。实际集成时，由 SDK 接入层根据业务需要把通话事件转换成录音命令，并提供真实通话时长。
-
-手动验证时通过页面的“结束录音”按钮停止录音。前台通知仅显示录音状态并提供返回 App 的入口，不提供结束录音操作。
-
-两种模式使用同一套权限要求。每次发起拨号或录音前，统一检查并申请尚未授权的电话、电话状态、通话记录及麦克风权限，全部获得后才能继续。Android 13 及以上同时申请尚未授权的通知权限，但拒绝通知权限不阻止本次操作。Service 准备会话时也统一检查必需权限，直接调用 Service 不能绕过要求。
-
-目前两种模式都使用 MediaRecorder 的 VOICE_RECOGNITION 音源。支持 SDK 录音生命周期不等于已经验证能采集其双向通话音频；实际收音效果需要针对 SDK 和设备单独验证。
-
-## 数据与文件
-
-- `durationSeconds == null`：通话时长未知；文件名不带 duration。
-- `durationSeconds == 0`：明确的零秒；文件名包含 `_0`。
-- 通话时长不是音频时长，不用录音长度填补未知通话时长。
-- 每条录音保存在 `files/recordings/<recordingId>/`。文件名为 `<phoneNumber>_<recordingStartedAtMs>[_<durationSeconds>].m4a`，直接使用校验后的电话号码。
-- 录制时写入 `audio.part`；成功停止并释放录音器后才发布元数据和最终文件名。未完成的录音不出现在列表中。
-- 每条录音的 `entry.json` 使用 AtomicFile 原子写入，随后重命名音频。进程在两步之间中断时，下次读取按已提交元数据完成重命名。
-- 所有时长修改、系统记录关联和文件重命名均由 Store 串行处理。普通重命名失败会尝试恢复旧元数据，保留音频；重复提交相同时长是幂等操作。
-- 文件名不是标识。调用方保存 recordingId，播放或导出前使用 `RecordingStore.audioFile` 取得当前文件。
+音源仍为 `MediaRecorder.AudioSource.VOICE_RECOGNITION`。录出有效 m4a 不等于录到了对方声音；需要在目标设备、系统版本、音频路由下实际试听。不要求 Google Play 上架不代表可以绕过 Android 音频和后台运行限制。
 
 ## 验证
 
 ```powershell
 .\gradlew.bat :app:assembleDebug :app:testDebugUnitTest :app:lintDebug
+.\gradlew.bat :app:assembleDebugAndroidTest
 .\gradlew.bat :app:connectedDebugAndroidTest
 ```
 
-设备测试涵盖实际麦克风采集与音频封装、SDK 会话、系统准备取消、过期命令、时长更新、重命名失败回滚和中断恢复。设备测试会申请全部必需权限，不会拨打电话。
+单元测试覆盖通话记录水位/时间窗口、协议命名/发布、重名保护、串行上传、失败重试、取消和重建上传器后重新扫描。上传测试注入假传输函数，不会访问网络。设备测试覆盖真实麦克风采集、重复结束、页面销毁取消后封装及清理，不会拨打电话。设备需解锁并允许测试页面前台运行。
+
+真机手动验证：
+
+- 系统录音：接通、未接、拒接、主动挂断；试听双方声音，检查回调号码/时间/时长。
+- 系统不录音：无麦克风授权也能回调记录，无录音通知和新文件。
+- 连续呼叫同一号码：不能拿上次记录作为本次结果。
+- 记录延迟、缺权限、拨号失败：明确返回错误，不错误回调历史记录。
+- SDK 模拟：未知时长留在 staging，零秒/指定时长发布到 pending；核对文件名与 JSON 的 number/date/duration 一致，JSON 不含本地文件路径。
+- 查看 Logcat 的 `RecordingUploader`：启动时及每轮间隔扫描；当前未接网络，文件应保留。重启 App 后应再次看到同名待上传文件。
+- 回到桌面再返回：请求继续；销毁页面再进入：没有恢复的旧请求或旧回调。
+- 录音失败时：系统电话继续等待终态和通话记录，Android 本地诊断单独报告录音错误。
