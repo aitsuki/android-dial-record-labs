@@ -40,209 +40,312 @@ import org.json.JSONObject
 /** 原生页面模拟 H5 请求；不引入 WebView，也不恢复已销毁页面的 callId。 */
 class MainActivity : AppCompatActivity() {
     private lateinit var binding: ActivityMainBinding
-    private enum class Mode(val recording: Boolean) { SYSTEM_RECORD(true), SYSTEM(false), SDK_SIMULATION(true) }
-    private data class Request(val callId: String, val number: String, val mode: Mode, val userId: String)
-    private var pendingRequest: Request? = null
-    private var requestJob: Job? = null
-    private var sdkEnded: CompletableDeferred<Long?>? = null
 
-    private val permissionLauncher = registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
-        val request = pendingRequest ?: return@registerForActivityResult
-        pendingRequest = null
-        if (permissions(request).all(::hasPermission)) launch(request)
-        else {
-            complete(request, JSONObject().put("error", "缺少本次操作所需权限"))
-            setBusy(false)
-        }
+    private enum class CallMode(val recordingEnabled: Boolean) {
+        SYSTEM_RECORD(true), SYSTEM(false), SDK_SIMULATION(
+            true
+        )
     }
+
+    private data class CallRequest(
+        val callId: String,
+        val phoneNumber: String,
+        val callMode: CallMode,
+        val userId: String
+    )
+
+    private val startupPermissions = buildList {
+        addAll(listOf(CALL_PHONE, READ_PHONE_STATE, READ_CALL_LOG, RECORD_AUDIO))
+        if (Build.VERSION.SDK_INT >= 33) add(POST_NOTIFICATIONS)
+    }
+    private var startupPermissionsGranted = false
+    private var permissionRequestInFlight = false
+    private var activeCallJob: Job? = null
+    private var sdkCallDurationResult: CompletableDeferred<Long?>? = null
+
+    private val startupPermissionLauncher =
+        registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
+            permissionRequestInFlight = false
+            startupPermissionsGranted = startupPermissions.all(::hasPermission)
+            if (startupPermissionsGranted) setCallControlsBusy(false)
+            else exitForMissingPermissions()
+        }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
-        val padding = (24 * resources.displayMetrics.density).toInt()
-        ViewCompat.setOnApplyWindowInsetsListener(binding.root) { view, insets ->
-            val bars = insets.getInsets(WindowInsetsCompat.Type.systemBars() or WindowInsetsCompat.Type.ime())
-            view.setPadding(padding + bars.left, padding + bars.top, padding + bars.right, padding + bars.bottom)
-            insets
+        val contentPaddingPx = (24 * resources.displayMetrics.density).toInt()
+        ViewCompat.setOnApplyWindowInsetsListener(binding.root) { rootView, windowInsets ->
+            val systemBarAndImeInsets =
+                windowInsets.getInsets(WindowInsetsCompat.Type.systemBars() or WindowInsetsCompat.Type.ime())
+            rootView.setPadding(
+                contentPaddingPx + systemBarAndImeInsets.left,
+                contentPaddingPx + systemBarAndImeInsets.top,
+                contentPaddingPx + systemBarAndImeInsets.right,
+                contentPaddingPx + systemBarAndImeInsets.bottom
+            )
+            windowInsets
         }
-        binding.source.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item,
-            listOf("系统通话 · 录音", "系统通话 · 不录音", "SDK 事件模拟 · 手动录音"))
+        binding.source.adapter = ArrayAdapter(
+            this, android.R.layout.simple_spinner_dropdown_item,
+            listOf(
+                "System call · Record",
+                "System call · No recording",
+                "SDK event simulation · Manual recording"
+            )
+        )
         binding.dialButton.setOnClickListener { requestCall() }
         binding.stopButton.setOnClickListener {
-            val text = binding.sdkDuration.text.toString().trim()
-            val duration = text.toLongOrNull()
-            if (text.isNotEmpty() && (duration == null || duration < 0)) {
-                binding.sdkDuration.error = "请输入非负整数，或留空表示未知"
-            } else sdkEnded?.complete(duration)
+            val sdkDurationInput = binding.sdkDuration.text.toString().trim()
+            val sdkCallDurationSeconds = sdkDurationInput.toLongOrNull()
+            if (sdkDurationInput.isNotEmpty() && (sdkCallDurationSeconds == null || sdkCallDurationSeconds < 0)) {
+                binding.sdkDuration.error =
+                    "Enter a non-negative integer, or leave blank for unknown"
+            } else sdkCallDurationResult?.complete(sdkCallDurationSeconds)
         }
-        setBusy(false)
+        permissionRequestInFlight =
+            savedInstanceState?.getBoolean("permissionRequestInFlight") ?: false
+        requestStartupPermissions()
     }
 
-    private fun permissions(request: Request): List<String> = buildList {
-        if (request.mode != Mode.SDK_SIMULATION) addAll(listOf(CALL_PHONE, READ_PHONE_STATE, READ_CALL_LOG))
-        if (request.mode.recording) add(RECORD_AUDIO)
+    override fun onSaveInstanceState(outState: Bundle) {
+        outState.putBoolean("permissionRequestInFlight", permissionRequestInFlight)
+        super.onSaveInstanceState(outState)
+    }
+
+    /** 启动时统一授权；授权完成前禁用操作，任一权限被拒绝则退出页面。 */
+    private fun requestStartupPermissions() {
+        val missingPermissions = startupPermissions.filterNot(::hasPermission)
+        startupPermissionsGranted = missingPermissions.isEmpty()
+        setCallControlsBusy(!startupPermissionsGranted)
+        if (startupPermissionsGranted || permissionRequestInFlight) return
+
+        permissionRequestInFlight = true
+        runCatching { startupPermissionLauncher.launch(missingPermissions.toTypedArray()) }
+            .onFailure {
+                permissionRequestInFlight = false
+                exitForMissingPermissions()
+            }
+    }
+
+    private fun exitForMissingPermissions() {
+        startupPermissionsGranted = false
+        setCallControlsBusy(true)
+        Toast.makeText(
+            this,
+            "All requested permissions are required. Closing the app.",
+            Toast.LENGTH_LONG
+        ).show()
+        finishAndRemoveTask()
     }
 
     private fun hasPermission(permission: String) =
         ContextCompat.checkSelfPermission(this, permission) == PackageManager.PERMISSION_GRANTED
 
     private fun requestCall() {
-        if (pendingRequest != null || requestJob?.isActive == true) return
-        val number = PhoneNumberUtils.normalizeNumber(binding.phoneNumber.text.toString().trim())
-        if (!Regex("\\+?[0-9]{1,32}").matches(number)) {
-            binding.phoneNumber.error = "请输入有效的电话号码"
+        if (!startupPermissionsGranted || activeCallJob?.isActive == true) return
+        val normalizedPhoneNumber =
+            PhoneNumberUtils.normalizeNumber(binding.phoneNumber.text.toString().trim())
+        if (!Regex("\\+?[0-9]{1,32}").matches(normalizedPhoneNumber)) {
+            binding.phoneNumber.error = "Enter a valid phone number"
             return
         }
-        val mode = Mode.entries[binding.source.selectedItemPosition]
-        val userId = binding.userId.text.toString().trim()
-        if (mode.recording && !RecordingFiles.validUserId(userId)) {
-            binding.userId.error = "请输入关联用 userId（字母、数字或连字符）"
+        val selectedCallMode = CallMode.entries[binding.source.selectedItemPosition]
+        val userIdInput = binding.userId.text.toString().trim()
+        if (selectedCallMode.recordingEnabled && !RecordingFiles.validUserId(userIdInput)) {
+            binding.userId.error = "Enter a correlation userId (letters, digits, or hyphens)"
             return
         }
-        val request = Request(UUID.randomUUID().toString(), number, mode, userId)
+        val callRequest = CallRequest(
+            callId = UUID.randomUUID().toString(),
+            phoneNumber = normalizedPhoneNumber,
+            callMode = selectedCallMode,
+            userId = userIdInput
+        )
         // 保留现有系统录音实验的无障碍前置条件；不录音和 SDK 模拟不需要。
-        if (request.mode == Mode.SYSTEM_RECORD && !CallAccessibilityService.isConnected) {
-            Toast.makeText(this, "请启用无障碍服务后重新发起", Toast.LENGTH_LONG).show()
+        if (callRequest.callMode == CallMode.SYSTEM_RECORD && !CallAccessibilityService.isConnected) {
+            Toast.makeText(
+                this,
+                "Enable the accessibility service, then try again",
+                Toast.LENGTH_LONG
+            ).show()
             runCatching { startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) }
-                .onFailure { complete(request, JSONObject().put("error", "无法打开无障碍设置")) }
+                .onFailure {
+                    completeCallRequest(
+                        callRequest,
+                        JSONObject().put("error", "Unable to open accessibility settings")
+                    )
+                }
             return
         }
-        setBusy(true)
+        setCallControlsBusy(true)
         binding.result.text = ""
-        binding.recordingStatus.text = if (mode.recording) "等待录音" else "本次不录音"
-        val missing = permissions(request).filterNot(::hasPermission).toMutableList()
-        if (request.mode.recording && Build.VERSION.SDK_INT >= 33 && !hasPermission(POST_NOTIFICATIONS)) {
-            missing += POST_NOTIFICATIONS // 拒绝通知权限不阻止录音。
-        }
-        if (missing.isEmpty()) launch(request)
-        else {
-            pendingRequest = request
-            runCatching { permissionLauncher.launch(missing.toTypedArray()) }.onFailure {
-                pendingRequest = null
-                complete(request, JSONObject().put("error", "无法申请权限：${it.message}"))
-                setBusy(false)
-            }
-        }
+        binding.recordingStatus.text =
+            if (selectedCallMode.recordingEnabled) "Waiting to record" else "No recording for this request"
+        launchCallRequest(callRequest)
     }
 
-    private fun launch(request: Request) {
-        requestJob = lifecycleScope.launch {
+    private fun launchCallRequest(callRequest: CallRequest) {
+        activeCallJob = lifecycleScope.launch {
             try {
-                // 权限结果可能在 onResume 之前交付，等页面恢复后再启动前台服务。
-                awaitResumed()
-                val result = if (request.mode.recording) {
-                    RecordingService.withRecorder(this@MainActivity) { perform(request, it) }
-                } else perform(request, null)
-                complete(request, result)
+                // 等页面恢复到前台后再启动录音服务。
+                awaitActivityResumed()
+                val callResultJson = if (callRequest.callMode.recordingEnabled) {
+                    RecordingService.withRecorder(this@MainActivity) { recordingService ->
+                        executeCallRequest(callRequest, recordingService)
+                    }
+                } else executeCallRequest(callRequest, null)
+                completeCallRequest(callRequest, callResultJson)
             } catch (e: TimeoutCancellationException) {
-                complete(request, JSONObject().put("error", "准备录音服务超时"))
+                completeCallRequest(
+                    callRequest,
+                    JSONObject().put("error", "Timed out preparing the recording service")
+                )
             } catch (e: CancellationException) {
                 throw e // 页面销毁：清理即可，不向新页面重放结果。
             } catch (e: Exception) {
-                complete(request, JSONObject().put("error", e.message ?: "请求失败"))
+                completeCallRequest(
+                    callRequest,
+                    JSONObject().put("error", e.message ?: "Request failed")
+                )
             } finally {
-                sdkEnded = null
-                setBusy(false)
+                sdkCallDurationResult = null
+                setCallControlsBusy(false)
             }
         }
     }
 
-    private suspend fun awaitResumed() {
-        val resumed = CompletableDeferred<Unit>()
-        val observer = LifecycleEventObserver { _, event ->
-            if (event == Lifecycle.Event.ON_RESUME) resumed.complete(Unit)
+    private suspend fun awaitActivityResumed() {
+        val activityResumedSignal = CompletableDeferred<Unit>()
+        val resumeObserver = LifecycleEventObserver { _, lifecycleEvent ->
+            if (lifecycleEvent == Lifecycle.Event.ON_RESUME) activityResumedSignal.complete(Unit)
         }
-        lifecycle.addObserver(observer) // 已处于 RESUMED 时也会立即收到对应事件。
-        try { resumed.await() } finally { lifecycle.removeObserver(observer) }
+        lifecycle.addObserver(resumeObserver) // 已处于 RESUMED 时也会立即收到对应事件。
+        try {
+            activityResumedSignal.await()
+        } finally {
+            lifecycle.removeObserver(resumeObserver)
+        }
     }
 
-    private suspend fun perform(request: Request, recorder: RecordingService?): JSONObject {
-        val result = JSONObject()
-        var number = request.number
-        var dateMs: Long? = null
-        var duration: Long? = null
+    private suspend fun executeCallRequest(
+        callRequest: CallRequest,
+        recordingService: RecordingService?
+    ): JSONObject {
+        val callResultJson = JSONObject()
+        var correlationPhoneNumber = callRequest.phoneNumber
+        var correlationDateMs: Long? = null
+        var callDurationSeconds: Long? = null
         try {
-            if (request.mode == Mode.SDK_SIMULATION) {
-                val ended = CompletableDeferred<Long?>()
-                sdkEnded = ended
-                val startedAt = System.currentTimeMillis()
-                recorder?.start()
+            if (callRequest.callMode == CallMode.SDK_SIMULATION) {
+                val sdkDurationResult = CompletableDeferred<Long?>()
+                sdkCallDurationResult = sdkDurationResult
+                val sdkCallStartedAtMs = System.currentTimeMillis()
+                recordingService?.start()
                 binding.stopButton.isEnabled = true
-                binding.sessionStatus.text = "模拟 SDK 录音中；手动结束时传入 SDK 通话时长（可未知）"
-                duration = ended.await()
-                dateMs = (recorder?.finish()?.startedAtMs ?: startedAt) / 1_000 * 1_000
-                result.put("sdk", JSONObject().put("simulated", true).put("number", number)
-                    .put("date", dateMs).put("duration", duration ?: JSONObject.NULL))
+                binding.sessionStatus.text =
+                    "Recording simulated SDK call; enter the SDK call duration when ending manually (may be unknown)"
+                callDurationSeconds = sdkDurationResult.await()
+                correlationDateMs =
+                    (recordingService?.finish()?.startedAtMs ?: sdkCallStartedAtMs) / 1_000 * 1_000
+                callResultJson.put(
+                    "sdk", JSONObject().put("simulated", true).put("number", correlationPhoneNumber)
+                        .put("date", correlationDateMs)
+                        .put("duration", callDurationSeconds ?: JSONObject.NULL)
+                )
             } else {
-                val afterId = CallLogMatcher.latestId(this)
+                val preDialCallLogId = CallLogMatcher.latestId(this)
                 // 查询水位期间用户可能已经离开页面，此时不再自动拨号。
-                check(lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) { "页面已离开，请重新发起通话" }
-                binding.sessionStatus.text = "等待系统通话开始"
-                val window = SystemCallController.call(this, request.number) {
-                    binding.sessionStatus.text = "系统通话中（OFFHOOK 不代表已接听）"
-                    recorder?.start()
+                check(lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) { "The Activity is no longer active; please start the call again" }
+                binding.sessionStatus.text = "Waiting for the system call to start"
+                val dialingWindow = SystemCallController.call(this, callRequest.phoneNumber) {
+                    binding.sessionStatus.text =
+                        "System call in progress (OFFHOOK does not imply an answer)"
+                    recordingService?.start()
                 }
-                val recording = recorder?.finish() // 挂断立即封装，查询记录不延长录音。
-                binding.sessionStatus.text = "通话已结束，等待本次系统记录"
-                val call = CallLogMatcher.await(this, request.number,
-                    CallLogWindow(afterId, window.requestedAtMs - 2_000, window.offhookAtMs + 2_000))
-                if (call == null) {
-                    result.put("callLog", JSONObject.NULL).put("error", "未找到唯一匹配的本次通话记录")
+                val recordingResult = recordingService?.finish() // 挂断立即封装，查询记录不延长录音。
+                binding.sessionStatus.text = "Call ended; waiting for its system call log entry"
+                val matchedCallLog = CallLogMatcher.await(
+                    this, callRequest.phoneNumber,
+                    CallLogWindow(
+                        preDialCallLogId,
+                        dialingWindow.requestedAtMs - 2_000,
+                        dialingWindow.offhookAtMs + 2_000
+                    )
+                )
+                if (matchedCallLog == null) {
+                    callResultJson.put("callLog", JSONObject.NULL)
+                        .put("error", "No unique matching call log entry was found for this call")
                 } else {
-                    number = PhoneNumberUtils.normalizeNumber(call.number)
+                    correlationPhoneNumber = PhoneNumberUtils.normalizeNumber(matchedCallLog.number)
                     // 沿用线上关联约定：有录音时以录音开始时间为 date，精确到秒。
-                    dateMs = (recording?.startedAtMs ?: call.date) / 1_000 * 1_000
-                    duration = call.duration
-                    result.put("callLog", JSONObject()
-                        .put("id", call.id).put("number", number).put("date", dateMs)
-                        .put("systemDate", call.date).put("duration", duration).put("type", call.type))
+                    correlationDateMs =
+                        (recordingResult?.startedAtMs ?: matchedCallLog.date) / 1_000 * 1_000
+                    callDurationSeconds = matchedCallLog.duration
+                    callResultJson.put(
+                        "callLog", JSONObject()
+                            .put("id", matchedCallLog.id).put("number", correlationPhoneNumber)
+                            .put("date", correlationDateMs)
+                            .put("systemDate", matchedCallLog.date)
+                            .put("duration", callDurationSeconds).put("type", matchedCallLog.type)
+                    )
                 }
             }
         } catch (e: TimeoutCancellationException) {
-            result.put("error", "等待系统拨号超时")
+            callResultJson.put("error", "Timed out waiting for system dialing")
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
-            result.put("error", e.message ?: "通话失败")
+            callResultJson.put("error", e.message ?: "Call failed")
         } finally {
-            recorder?.finish()?.let {
+            recordingService?.finish()?.let { recordingResult ->
                 // Android 本地诊断，与 H5 回调 JSON 分开，绝不把文件地址交给 H5 上传。
-                binding.recordingStatus.text = it.error ?: if (it.file != null) {
-                    "已封装，关联信息未完整时保留在临时区：${it.file.name}"
-                } else "本次未产生录音"
+                binding.recordingStatus.text =
+                    recordingResult.error ?: if (recordingResult.file != null) {
+                        "Finalized; retained in staging until correlation information is complete: ${recordingResult.file.name}"
+                    } else "No recording was produced for this request"
             }
         }
-        val audio = recorder?.finish()?.file
-        if (audio != null && dateMs != null && duration != null) {
+        val finalizedRecordingFile = recordingService?.finish()?.file
+        if (finalizedRecordingFile != null && correlationDateMs != null && callDurationSeconds != null) {
             try {
-                val pending = withContext(Dispatchers.IO) {
-                    (application as LabApplication).recordings.publish(audio, request.userId, number, dateMs, duration)
+                val pendingUploadFile = withContext(Dispatchers.IO) {
+                    (application as LabApplication).recordingFiles.publish(
+                        finalizedRecordingFile,
+                        callRequest.userId,
+                        correlationPhoneNumber,
+                        correlationDateMs,
+                        callDurationSeconds
+                    )
                 }
-                binding.recordingStatus.text = "已加入待上传目录：${pending.name}（实验上传接口尚未接入）"
+                binding.recordingStatus.text =
+                    "Added to the pending upload directory: ${pendingUploadFile.name} (lab upload API not yet integrated)"
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
-                binding.recordingStatus.text = "无法发布录音，原文件保留：${e.message}"
+                binding.recordingStatus.text =
+                    "Unable to publish recording; original file retained: ${e.message}"
             }
         }
-        return result
+        return callResultJson
     }
 
     /** 这里就是移植到线上时调用 H5 的位置；callId 始终来自同一个不可变请求。 */
-    private fun complete(request: Request, result: JSONObject) {
-        result.put("callId", request.callId).put("number", request.number).put("mode", request.mode.name)
-        binding.result.text = result.toString(2)
-        binding.sessionStatus.text = "请求结束"
-        Log.i("CallResult", result.toString())
+    private fun completeCallRequest(callRequest: CallRequest, callResultJson: JSONObject) {
+        callResultJson.put("callId", callRequest.callId).put("number", callRequest.phoneNumber)
+            .put("mode", callRequest.callMode.name)
+        binding.result.text = callResultJson.toString(2)
+        binding.sessionStatus.text = "Request completed"
+        Log.i("CallResult", callResultJson.toString())
     }
 
-    private fun setBusy(busy: Boolean) {
-        binding.dialButton.isEnabled = !busy
-        binding.source.isEnabled = !busy
-        binding.phoneNumber.isEnabled = !busy
-        binding.userId.isEnabled = !busy
-        binding.stopButton.isEnabled = busy && sdkEnded != null
+    private fun setCallControlsBusy(isCallRequestActive: Boolean) {
+        binding.dialButton.isEnabled = !isCallRequestActive
+        binding.source.isEnabled = !isCallRequestActive
+        binding.phoneNumber.isEnabled = !isCallRequestActive
+        binding.userId.isEnabled = !isCallRequestActive
+        binding.stopButton.isEnabled = isCallRequestActive && sdkCallDurationResult != null
     }
 }

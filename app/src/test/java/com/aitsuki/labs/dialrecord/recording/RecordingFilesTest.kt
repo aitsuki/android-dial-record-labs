@@ -49,7 +49,7 @@ class RecordingFilesTest {
 
     @Test fun partAndEmptyFilesCannotBePublished() {
         val files = RecordingFiles(temporary.root)
-        val part = files.create().apply { writeText("still recording") }
+        val part = files.newStagingFile().apply { writeText("still recording") }
         assertThrows(IllegalStateException::class.java) { files.publish(part, "lab", "123", dateMs, 1) }
         val empty = sealed(files).apply { writeText("") }
         assertThrows(IllegalStateException::class.java) { files.publish(empty, "lab", "123", dateMs, 1) }

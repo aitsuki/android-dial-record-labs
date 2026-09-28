@@ -10,14 +10,14 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 
 class LabApplication : Application() {
-    lateinit var recordings: RecordingFiles
+    lateinit var recordingFiles: RecordingFiles
         private set
     private val uploadScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     override fun onCreate() {
         super.onCreate()
-        recordings = RecordingFiles(File(filesDir, "recordings"))
-        RecordingUploader(recordings.pending, ::uploadRecording) { file, error ->
+        recordingFiles = RecordingFiles(File(filesDir, "recordings"))
+        RecordingUploader(recordingFiles.pending, ::uploadRecording) { file, error ->
             Log.w("RecordingUploader", "上传保留待重试：${file?.name}", error)
         }.start(uploadScope)
     }

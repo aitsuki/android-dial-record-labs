@@ -17,6 +17,7 @@ import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleOwner
+import com.aitsuki.labs.dialrecord.LabApplication
 import com.aitsuki.labs.dialrecord.R
 import com.aitsuki.labs.dialrecord.ui.MainActivity
 import java.io.File
@@ -42,11 +43,11 @@ class RecordingService : Service() {
                     ready.complete(requireNotNull(service))
                 }
                 override fun onServiceDisconnected(name: ComponentName) {
-                    service?.fail("录音服务连接中断")
-                    ready.completeExceptionally(IllegalStateException("录音服务连接中断"))
+                    service?.fail("Recording service disconnected")
+                    ready.completeExceptionally(IllegalStateException("Recording service disconnected"))
                 }
                 override fun onNullBinding(name: ComponentName) {
-                    ready.completeExceptionally(IllegalStateException("无法绑定录音服务"))
+                    ready.completeExceptionally(IllegalStateException("Unable to bind the recording service"))
                 }
                 override fun onBindingDied(name: ComponentName) = onServiceDisconnected(name)
             }
@@ -54,13 +55,13 @@ class RecordingService : Service() {
             var ownsRecorder = false
             try {
                 bound = context.bindService(Intent(context, RecordingService::class.java), connection, Context.BIND_AUTO_CREATE)
-                check(bound) { "无法绑定录音服务" }
+                check(bound) { "Unable to bind the recording service" }
                 val recorder = withTimeout(10_000) { ready.await() }
                 // 必须在页面可见、发起系统拨号之前建立麦克风前台服务。
                 if (context is LifecycleOwner) {
-                    check(context.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) { "页面已离开，请重新发起通话" }
+                    check(context.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) { "The Activity is no longer active; please start the call again" }
                 }
-                check(!recorder.inUse) { "已有录音请求" }
+                check(!recorder.inUse) { "A recording request already exists" }
                 recorder.inUse = true
                 ownsRecorder = true
                 recorder.foreground()
@@ -86,21 +87,21 @@ class RecordingService : Service() {
 
     private fun foreground() {
         // 上次解绑后系统可能尚未销毁实例；新请求只复用服务，不复用录音结果。
-        check(recorder == null) { "已有录音正在进行" }
+        check(recorder == null) { "A recording is already in progress" }
         pendingFile = null
         started = false
         finished = false
         result = RecordingResult()
         if (Build.VERSION.SDK_INT >= 26) {
             getSystemService(NotificationManager::class.java).createNotificationChannel(
-                NotificationChannel("recording", "通话录音验证", NotificationManager.IMPORTANCE_LOW))
+                NotificationChannel("recording", "Call Recording Lab", NotificationManager.IMPORTANCE_LOW))
         }
         val open = PendingIntent.getActivity(this, 0,
             Intent.makeMainActivity(ComponentName(this, MainActivity::class.java)),
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
         val notification = NotificationCompat.Builder(this, "recording")
-            .setSmallIcon(R.drawable.ic_recording).setContentTitle("通话录音验证")
-            .setContentText("本次请求的录音服务已就绪").setContentIntent(open).setOngoing(true).build()
+            .setSmallIcon(R.drawable.ic_recording).setContentTitle("Call Recording Lab")
+            .setContentText("The recording service is ready for this request").setContentIntent(open).setOngoing(true).build()
         ServiceCompat.startForeground(this, 1, notification,
             if (Build.VERSION.SDK_INT >= 30) ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE else 0)
     }
@@ -109,7 +110,7 @@ class RecordingService : Service() {
     fun start() {
         if (recorder != null || finished) return
         try {
-            val file = RecordingFiles(File(filesDir, "recordings")).create()
+            val file = (application as LabApplication).recordingFiles.newStagingFile()
             pendingFile = file
             @Suppress("DEPRECATION")
             val media = if (Build.VERSION.SDK_INT >= 31) MediaRecorder(this) else MediaRecorder()
@@ -120,14 +121,14 @@ class RecordingService : Service() {
             media.setAudioEncodingBitRate(128_000)
             media.setAudioSamplingRate(44_100)
             media.setOutputFile(file.absolutePath)
-            media.setOnErrorListener { _, what, extra -> fail("录音器错误：$what/$extra") }
+            media.setOnErrorListener { _, what, extra -> fail("Recorder error: $what/$extra") }
             media.prepare()
             val startedAtMs = System.currentTimeMillis()
             media.start()
             started = true
             result = result.copy(startedAtMs = startedAtMs)
         } catch (e: Exception) {
-            fail("无法启动录音：${e.message}")
+            fail("Unable to start recording: ${e.message}")
         }
     }
 
@@ -145,10 +146,10 @@ class RecordingService : Service() {
         try {
             if (started) media?.stop()
         } catch (e: Exception) {
-            result = result.copy(error = "无法结束录音：${e.message}")
+            result = result.copy(error = "Unable to finish recording: ${e.message}")
         } finally {
             runCatching { media?.release() }.onFailure {
-                result = result.copy(error = "无法释放录音器：${it.message}")
+                result = result.copy(error = "Unable to release the recorder: ${it.message}")
             }
         }
         pendingFile?.let { file ->
@@ -157,7 +158,7 @@ class RecordingService : Service() {
                 result = result.copy(file = target)
             } else {
                 file.delete()
-                if (result.error == null) result = RecordingResult(error = "未生成有效录音文件")
+                if (result.error == null) result = RecordingResult(error = "No valid recording file was generated")
             }
         }
         stopForeground(STOP_FOREGROUND_REMOVE)

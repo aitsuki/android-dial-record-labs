@@ -36,8 +36,8 @@ class RecordingUploader(
     internal suspend fun uploadPending() {
         val files = try {
             if (!directory.exists()) return
-            check(directory.isDirectory) { "待上传路径不是目录" }
-            checkNotNull(directory.listFiles()) { "无法扫描待上传目录" }
+            check(directory.isDirectory) { "The pending upload path is not a directory" }
+            checkNotNull(directory.listFiles()) { "Unable to scan the pending upload directory" }
                 .filter(RecordingFiles::isUploadFile).sortedBy { it.name }
         } catch (e: Exception) {
             onError(null, e)
@@ -49,7 +49,7 @@ class RecordingUploader(
                 if (upload(file)) {
                     // 上传已成功但在响应期间取消：保留文件，下次用同名文件重试。
                     currentCoroutineContext().ensureActive()
-                    check(file.delete()) { "上传成功，但无法删除本地文件" }
+                    check(file.delete()) { "Upload succeeded, but the local file could not be deleted" }
                 }
             } catch (e: CancellationException) {
                 throw e

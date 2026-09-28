@@ -8,21 +8,24 @@ class RecordingFiles(root: File) {
     val staging = File(root, "staging")
     val pending = File(root, "pending")
 
-    fun create(): File {
-        check(staging.isDirectory || staging.mkdirs()) { "无法创建录音临时目录" }
+    /** 为本次录音分配 staging 下的 .part 路径；只创建目录，文件由录音器写入。 */
+    fun newStagingFile(): File {
+        check(staging.isDirectory || staging.mkdirs()) { "Unable to create the recording staging directory" }
         return File(staging, "${UUID.randomUUID()}.part")
     }
 
     /** 同一文件系统内重命名发布；只在拿到完整关联字段后调用，失败保留原文件。 */
     fun publish(audio: File, userId: String, number: String, dateMs: Long, duration: Long): File {
         val name = uploadName(userId, number, dateMs, duration)
-        check(audio.parentFile?.canonicalFile == staging.canonicalFile &&
-            audio.extension == "m4a" && audio.isFile && audio.length() > 0) { "录音尚未正确封装" }
-        check(pending.isDirectory || pending.mkdirs()) { "无法创建待上传目录" }
+        check(
+            audio.parentFile?.canonicalFile == staging.canonicalFile &&
+                    audio.extension == "m4a" && audio.isFile && audio.length() > 0
+        ) { "The recording has not been finalized correctly" }
+        check(pending.isDirectory || pending.mkdirs()) { "Unable to create the pending upload directory" }
         val target = File(pending, name)
         // 不能添加 UUID 改变协议，也不能覆盖另一次通话的文件。
-        check(!target.exists()) { "待上传文件名冲突：$name" }
-        check(audio.renameTo(target)) { "无法发布待上传录音" }
+        check(!target.exists()) { "Pending upload filename conflict: $name" }
+        check(audio.renameTo(target)) { "Unable to publish the recording for upload" }
         return target
     }
 
@@ -31,14 +34,14 @@ class RecordingFiles(root: File) {
 
         /** 与回调使用同一份号码、date 和 duration；date 已明确为秒精度的毫秒值。 */
         fun uploadName(userId: String, number: String, dateMs: Long, duration: Long): String {
-            require(validUserId(userId)) { "userId 不能为空，也不能包含下划线或路径字符" }
-            require(Regex("\\+?[0-9]{1,32}").matches(number)) { "关联号码无效" }
-            require(dateMs > 0 && dateMs % 1_000 == 0L) { "关联时间必须为秒精度的毫秒时间戳" }
-            require(duration >= 0) { "关联时长必须已知且非负" }
+            require(validUserId(userId)) { "userId must not be empty or contain underscores or path characters" }
+            require(Regex("\\+?[0-9]{1,32}").matches(number)) { "Invalid correlation phone number" }
+            require(dateMs > 0 && dateMs % 1_000 == 0L) { "The correlation time must be a millisecond timestamp with second precision" }
+            require(duration >= 0) { "The correlation duration must be known and non-negative" }
             return "${userId}_${number}_${dateMs / 1_000}_${duration}.m4a"
         }
 
         fun isUploadFile(file: File) = file.isFile && file.length() > 0 &&
-            Regex("[A-Za-z0-9-]+_\\+?[0-9]{1,32}_[0-9]+_[0-9]+\\.m4a").matches(file.name)
+                Regex("[A-Za-z0-9-]+_\\+?[0-9]{1,32}_[0-9]+_[0-9]+\\.m4a").matches(file.name)
     }
 }

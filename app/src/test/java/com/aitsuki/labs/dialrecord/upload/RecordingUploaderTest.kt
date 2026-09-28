@@ -53,7 +53,7 @@ class RecordingUploaderTest {
 
     @Test fun ignoresStagingPartEmptyAndMalformedFiles() = runBlocking {
         val files = RecordingFiles(temporary.root)
-        val part = files.create().apply { writeText("recording") }
+        val part = files.newStagingFile().apply { writeText("recording") }
         val sealed = File(files.staging, "sealed.m4a").apply { writeText("sealed but not associated") }
         files.pending.mkdirs()
         File(files.pending, "lab_123_1700000000_1.part").writeText("unfinished")

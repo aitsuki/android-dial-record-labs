@@ -80,7 +80,7 @@ class RecordingServiceTest {
                         }
                         callbackCount++
                     } finally {
-                        cleaned.complete(service?.finish() ?: RecordingResult(error = "未连接"))
+                        cleaned.complete(service?.finish() ?: RecordingResult(error = "Not connected"))
                     }
                 }
             }

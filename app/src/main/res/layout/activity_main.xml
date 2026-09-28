@@ -16,7 +16,7 @@
         android:id="@+id/user_id"
         android:layout_width="match_parent"
         android:layout_height="48dp"
-        android:hint="userId（文件关联，实验值）"
+        android:hint="userId (file correlation, lab value)"
         android:text="lab"
         android:importantForAutofill="no"
         android:inputType="textNoSuggestions"
@@ -26,7 +26,7 @@
         android:id="@+id/phone_number"
         android:layout_width="match_parent"
         android:layout_height="48dp"
-        android:hint="电话号码"
+        android:hint="Phone number"
         android:importantForAutofill="no"
         android:inputType="phone"
         android:maxLength="128" />
@@ -35,13 +35,13 @@
         android:id="@+id/dial_button"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:text="发起本次请求" />
+        android:text="Start request" />
 
     <EditText
         android:id="@+id/sdk_duration"
         android:layout_width="match_parent"
         android:layout_height="48dp"
-        android:hint="模拟 SDK 通话时长（秒，可留空）"
+        android:hint="Simulated SDK call duration (seconds, optional)"
         android:importantForAutofill="no"
         android:inputType="number"
         android:maxLength="10" />
@@ -50,19 +50,19 @@
         android:id="@+id/stop_button"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:text="模拟 SDK 通话结束" />
+        android:text="Simulate SDK call end" />
 
     <TextView
         android:id="@+id/session_status"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:text="当前没有通话请求" />
+        android:text="No active call request" />
 
     <TextView
         android:id="@+id/recording_status"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:text="Android 上传诊断（不属于 H5 回调）"
+        android:text="Android upload diagnostics (not part of the H5 callback)"
         android:textIsSelectable="true" />
 
     <ScrollView

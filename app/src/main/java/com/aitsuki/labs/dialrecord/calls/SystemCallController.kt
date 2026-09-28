@@ -18,7 +18,7 @@ object SystemCallController {
 
     @SuppressLint("MissingPermission")
     suspend fun call(context: Context, number: String, onOffhook: () -> Unit): Window {
-        check(!context.getSystemService(TelecomManager::class.java).isInCall) { "当前已有通话" }
+        check(!context.getSystemService(TelecomManager::class.java).isInCall) { "A call is already in progress" }
         val states = Channel<String>(Channel.UNLIMITED)
         val receiver = object : BroadcastReceiver() {
             override fun onReceive(context: Context, intent: Intent) {
@@ -36,7 +36,7 @@ object SystemCallController {
                 while (!offhook) {
                     when (states.receive()) {
                         TelephonyManager.EXTRA_STATE_OFFHOOK -> offhook = true
-                        TelephonyManager.EXTRA_STATE_RINGING -> error("来电中断了拨号等待")
+                        TelephonyManager.EXTRA_STATE_RINGING -> error("An incoming call interrupted the wait for dialing")
                     }
                 }
             }
