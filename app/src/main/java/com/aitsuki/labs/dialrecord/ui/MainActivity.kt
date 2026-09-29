@@ -6,7 +6,6 @@ import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
-import android.telephony.PhoneNumberUtils
 import android.util.Log
 import android.widget.ArrayAdapter
 import android.widget.Toast
@@ -146,9 +145,9 @@ class MainActivity : AppCompatActivity() {
 
     private fun requestCall() {
         if (!startupPermissionsGranted || activeCallJob?.isActive == true) return
-        val normalizedPhoneNumber =
-            PhoneNumberUtils.normalizeNumber(binding.phoneNumber.text.toString().trim())
-        if (!Regex("\\+?[0-9]{1,32}").matches(normalizedPhoneNumber)) {
+        // 号码是业务关联键：保留用户原始输入，不裁剪、不格式化；无效输入直接拒绝。
+        val phoneNumber = binding.phoneNumber.text.toString()
+        if (!Regex("\\+?[0-9]{1,32}").matches(phoneNumber)) {
             binding.phoneNumber.error = "Enter a valid phone number"
             return
         }
@@ -160,7 +159,7 @@ class MainActivity : AppCompatActivity() {
         }
         val callRequest = CallRequest(
             callId = UUID.randomUUID().toString(),
-            phoneNumber = normalizedPhoneNumber,
+            phoneNumber = phoneNumber,
             callMode = selectedCallMode,
             userId = userIdInput
         )
@@ -235,7 +234,8 @@ class MainActivity : AppCompatActivity() {
         recordingService: RecordingService?
     ): JSONObject {
         val callResultJson = JSONObject()
-        var correlationPhoneNumber = callRequest.phoneNumber
+        // 回调与录音文件始终使用请求号码，系统通话记录不得覆盖业务关联键。
+        val correlationPhoneNumber = callRequest.phoneNumber
         var correlationDateMs: Long? = null
         var callDurationSeconds: Long? = null
         try {
@@ -279,7 +279,6 @@ class MainActivity : AppCompatActivity() {
                     callResultJson.put("callLog", JSONObject.NULL)
                         .put("error", "No unique matching call log entry was found for this call")
                 } else {
-                    correlationPhoneNumber = PhoneNumberUtils.normalizeNumber(matchedCallLog.number)
                     // 沿用线上关联约定：有录音时以录音开始时间为 date，精确到秒。
                     correlationDateMs =
                         (recordingResult?.startedAtMs ?: matchedCallLog.date) / 1_000 * 1_000
@@ -287,6 +286,7 @@ class MainActivity : AppCompatActivity() {
                     callResultJson.put(
                         "callLog", JSONObject()
                             .put("id", matchedCallLog.id).put("number", correlationPhoneNumber)
+                            .put("systemNumber", matchedCallLog.number)
                             .put("date", correlationDateMs)
                             .put("systemDate", matchedCallLog.date)
                             .put("duration", callDurationSeconds).put("type", matchedCallLog.type)
