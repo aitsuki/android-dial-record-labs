@@ -40,11 +40,21 @@ class RecordingFilesTest {
         val files = RecordingFiles(temporary.root)
         val audio = sealed(files)
         assertFalse(files.pending.exists())
-        val published = files.publish(audio, "lab", "123", dateMs, 5)
+        val published = checkNotNull(files.publish(audio, "lab", "123", dateMs, 5))
         assertFalse(audio.exists())
         assertEquals(files.pending, published.parentFile)
         assertEquals("sealed audio", published.readText())
         assertTrue(RecordingFiles.isUploadFile(published))
+    }
+
+    @Test fun shortRecordingsAreDeletedWithoutEnteringPending() {
+        val files = RecordingFiles(temporary.root)
+        for (duration in 0L..4L) {
+            val audio = sealed(files)
+            assertNull(files.publish(audio, "lab", "123", dateMs, duration))
+            assertFalse(audio.exists())
+            assertFalse(files.pending.exists())
+        }
     }
 
     @Test fun partAndEmptyFilesCannotBePublished() {
@@ -59,9 +69,9 @@ class RecordingFilesTest {
 
     @Test fun filenameCollisionPreservesBothFilesInsteadOfOverwriting() {
         val files = RecordingFiles(temporary.root)
-        val first = files.publish(sealed(files), "lab", "123", dateMs, 1)
+        val first = checkNotNull(files.publish(sealed(files), "lab", "123", dateMs, 5))
         val second = sealed(files, "second.m4a").apply { writeText("another call") }
-        assertThrows(IllegalStateException::class.java) { files.publish(second, "lab", "123", dateMs, 1) }
+        assertThrows(IllegalStateException::class.java) { files.publish(second, "lab", "123", dateMs, 5) }
         assertEquals("sealed audio", first.readText())
         assertEquals("another call", second.readText())
     }

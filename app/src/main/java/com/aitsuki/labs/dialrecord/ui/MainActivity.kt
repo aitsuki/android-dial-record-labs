@@ -320,8 +320,11 @@ class MainActivity : AppCompatActivity() {
                         callDurationSeconds
                     )
                 }
-                binding.recordingStatus.text =
+                binding.recordingStatus.text = if (pendingUploadFile == null) {
+                    "Recording deleted: call duration is less than 5 seconds; upload skipped"
+                } else {
                     "Added to the pending upload directory: ${pendingUploadFile.name} (lab upload API not yet integrated)"
+                }
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {

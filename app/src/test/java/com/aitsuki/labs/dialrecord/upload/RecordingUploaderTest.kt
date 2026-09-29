@@ -23,9 +23,9 @@ class RecordingUploaderTest {
         File(temporary.root, name).apply { writeText("audio") }
 
     @Test fun onlyAcknowledgedFileIsDeletedAndFailureDoesNotBlockOthers() = runBlocking {
-        val rejected = pending("a_123_1700000000_1.m4a")
-        val failed = pending("b_123_1700000000_1.m4a")
-        val accepted = pending("c_123_1700000000_1.m4a")
+        val rejected = pending("a_123_1700000000_5.m4a")
+        val failed = pending("b_123_1700000000_5.m4a")
+        val accepted = pending("c_123_1700000000_5.m4a")
         val errors = mutableListOf<File?>()
         val uploader = RecordingUploader(temporary.root, { file ->
             when (file) {

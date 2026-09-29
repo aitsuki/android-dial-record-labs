@@ -14,13 +14,17 @@ class RecordingFiles(root: File) {
         return File(staging, "${UUID.randomUUID()}.part")
     }
 
-    /** 同一文件系统内重命名发布；只在拿到完整关联字段后调用，失败保留原文件。 */
-    fun publish(audio: File, userId: String, number: String, dateMs: Long, duration: Long): File {
+    /** 短通话删除音频并返回 null；其余同一文件系统内重命名发布，失败保留原文件。 */
+    fun publish(audio: File, userId: String, number: String, dateMs: Long, duration: Long): File? {
         val name = uploadName(userId, number, dateMs, duration)
         check(
             audio.parentFile?.canonicalFile == staging.canonicalFile &&
                     audio.extension == "m4a" && audio.isFile && audio.length() > 0
         ) { "The recording has not been finalized correctly" }
+        if (duration < MIN_UPLOAD_DURATION_SECONDS) {
+            check(audio.delete()) { "Short recording could not be deleted" }
+            return null
+        }
         check(pending.isDirectory || pending.mkdirs()) { "Unable to create the pending upload directory" }
         val target = File(pending, name)
         // 不能添加 UUID 改变协议，也不能覆盖另一次通话的文件。
@@ -30,6 +34,8 @@ class RecordingFiles(root: File) {
     }
 
     companion object {
+        const val MIN_UPLOAD_DURATION_SECONDS = 5L
+
         fun validUserId(value: String) = Regex("[A-Za-z0-9-]+").matches(value)
 
         /** 与回调使用同一份号码、date 和 duration；date 已明确为秒精度的毫秒值。 */
