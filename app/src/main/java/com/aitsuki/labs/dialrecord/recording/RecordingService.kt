@@ -17,14 +17,20 @@ import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleOwner
+import com.aitsuki.labs.dialrecord.AppLog
 import com.aitsuki.labs.dialrecord.LabApplication
+import com.aitsuki.labs.dialrecord.MainActivity
 import com.aitsuki.labs.dialrecord.R
-import com.aitsuki.labs.dialrecord.ui.MainActivity
-import java.io.File
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.withTimeout
+import java.io.File
+import kotlin.time.Duration.Companion.milliseconds
 
-data class RecordingResult(val file: File? = null, val error: String? = null, val startedAtMs: Long? = null)
+data class RecordingResult(
+    val file: File? = null,
+    val error: String? = null,
+    val startedAtMs: Long? = null
+)
 
 /** 只负责麦克风和前台通知。不监听电话，不查询通话记录，不持久化会话。主线程调用。 */
 class RecordingService : Service() {
@@ -40,24 +46,31 @@ class RecordingService : Service() {
             val connection = object : ServiceConnection {
                 override fun onServiceConnected(name: ComponentName, binder: IBinder) {
                     service = (binder as LocalBinder).service
-                    ready.complete(requireNotNull(service))
+                    ready.complete(service)
                 }
+
                 override fun onServiceDisconnected(name: ComponentName) {
+                    AppLog.warn("录音服务连接断开")
                     service?.fail("Recording service disconnected")
                     ready.completeExceptionally(IllegalStateException("Recording service disconnected"))
                 }
+
                 override fun onNullBinding(name: ComponentName) {
                     ready.completeExceptionally(IllegalStateException("Unable to bind the recording service"))
                 }
+
                 override fun onBindingDied(name: ComponentName) = onServiceDisconnected(name)
             }
             var bound = false
             var ownsRecorder = false
             try {
-                bound = context.bindService(Intent(context, RecordingService::class.java), connection, Context.BIND_AUTO_CREATE)
+                bound = context.bindService(
+                    Intent(context, RecordingService::class.java), connection,
+                    BIND_AUTO_CREATE
+                )
                 check(bound) { "Unable to bind the recording service" }
-                val recorder = withTimeout(10_000) { ready.await() }
-                // 必须在页面可见、发起系统拨号之前建立麦克风前台服务。
+                val recorder = withTimeout(10_000.milliseconds) { ready.await() }
+                // Set up the microphone foreground service while the Activity is visible, before starting a system call.
                 if (context is LifecycleOwner) {
                     check(context.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) { "The Activity is no longer active; please start the call again" }
                 }
@@ -65,6 +78,7 @@ class RecordingService : Service() {
                 recorder.inUse = true
                 ownsRecorder = true
                 recorder.foreground()
+                AppLog.info("录音服务已绑定，麦克风前台服务已启动")
                 return block(recorder)
             } finally {
                 if (ownsRecorder) {
@@ -94,23 +108,34 @@ class RecordingService : Service() {
         result = RecordingResult()
         if (Build.VERSION.SDK_INT >= 26) {
             getSystemService(NotificationManager::class.java).createNotificationChannel(
-                NotificationChannel("recording", "Call Recording Lab", NotificationManager.IMPORTANCE_LOW))
+                NotificationChannel(
+                    "recording",
+                    "Call Recording Lab",
+                    NotificationManager.IMPORTANCE_LOW
+                )
+            )
         }
-        val open = PendingIntent.getActivity(this, 0,
+        val open = PendingIntent.getActivity(
+            this, 0,
             Intent.makeMainActivity(ComponentName(this, MainActivity::class.java)),
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
         val notification = NotificationCompat.Builder(this, "recording")
-            .setSmallIcon(R.drawable.ic_recording).setContentTitle("Call Recording Lab")
-            .setContentText("The recording service is ready for this request").setContentIntent(open).setOngoing(true).build()
-        ServiceCompat.startForeground(this, 1, notification,
-            if (Build.VERSION.SDK_INT >= 30) ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE else 0)
+            .setSmallIcon(R.drawable.ic_recording)
+            .setContentTitle("Recording")
+            .setContentText("Call recording monitoring.")
+            .setContentIntent(open).setOngoing(true).build()
+        ServiceCompat.startForeground(
+            this, 1, notification,
+            if (Build.VERSION.SDK_INT >= 30) ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE else 0
+        )
     }
 
     /** 失败记录在结果中，不抛出以打断通话结果的等待。 */
     fun start() {
         if (recorder != null || finished) return
         try {
-            val file = (application as LabApplication).recordingFiles.newStagingFile()
+            val file = LabApplication.app.recordingFiles.newStagingFile()
             pendingFile = file
             @Suppress("DEPRECATION")
             val media = if (Build.VERSION.SDK_INT >= 31) MediaRecorder(this) else MediaRecorder()
@@ -118,16 +143,22 @@ class RecordingService : Service() {
             media.setAudioSource(MediaRecorder.AudioSource.VOICE_RECOGNITION)
             media.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
             media.setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
-            media.setAudioEncodingBitRate(128_000)
-            media.setAudioSamplingRate(44_100)
             media.setOutputFile(file.absolutePath)
-            media.setOnErrorListener { _, what, extra -> fail("Recorder error: $what/$extra") }
+            media.setOnErrorListener { _, what, extra ->
+                AppLog.error(
+                    "录音器运行出错：what=%s，extra=%s",
+                    IllegalStateException("MediaRecorder error: $what/$extra"), what, extra
+                )
+                fail("Recorder error: $what/$extra")
+            }
             media.prepare()
             val startedAtMs = System.currentTimeMillis()
             media.start()
             started = true
             result = result.copy(startedAtMs = startedAtMs)
+            AppLog.info("录音已开始：文件=%s", file.name)
         } catch (e: Exception) {
+            AppLog.error("录音启动失败：%s", e, e.message)
             fail("Unable to start recording: ${e.message}")
         }
     }
@@ -146,9 +177,11 @@ class RecordingService : Service() {
         try {
             if (started) media?.stop()
         } catch (e: Exception) {
+            AppLog.error("停止录音失败：%s", e, e.message)
             result = result.copy(error = "Unable to finish recording: ${e.message}")
         } finally {
             runCatching { media?.release() }.onFailure {
+                AppLog.error("释放录音器失败：%s", it, it.message)
                 result = result.copy(error = "Unable to release the recorder: ${it.message}")
             }
         }
@@ -158,10 +191,24 @@ class RecordingService : Service() {
                 result = result.copy(file = target)
             } else {
                 file.delete()
-                if (result.error == null) result = RecordingResult(error = "No valid recording file was generated")
+                if (result.error == null) result =
+                    RecordingResult(error = "No valid recording file was generated")
             }
         }
         stopForeground(STOP_FOREGROUND_REMOVE)
+        when {
+            result.file != null -> AppLog.info(
+                "录音文件已生成，暂存 staging：文件=%s，大小=%s 字节",
+                result.file?.name, result.file?.length()
+            )
+
+            result.error != null -> AppLog.warn(
+                "录音未生成有效文件：文件=%s，原因=%s",
+                pendingFile?.name, result.error
+            )
+
+            else -> AppLog.info("录音请求已结束，未启动录音")
+        }
         return result
     }
 

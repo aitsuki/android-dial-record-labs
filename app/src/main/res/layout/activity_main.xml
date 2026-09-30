@@ -7,21 +7,6 @@
     android:padding="24dp"
     tools:ignore="HardcodedText">
 
-    <Spinner
-        android:id="@+id/source"
-        android:layout_width="match_parent"
-        android:layout_height="48dp" />
-
-    <EditText
-        android:id="@+id/user_id"
-        android:layout_width="match_parent"
-        android:layout_height="48dp"
-        android:hint="userId (file correlation, lab value)"
-        android:text="lab"
-        android:importantForAutofill="no"
-        android:inputType="textNoSuggestions"
-        android:maxLength="64" />
-
     <EditText
         android:id="@+id/phone_number"
         android:layout_width="match_parent"
@@ -37,43 +22,24 @@
         android:layout_height="wrap_content"
         android:text="Start request" />
 
-    <EditText
-        android:id="@+id/sdk_duration"
-        android:layout_width="match_parent"
-        android:layout_height="48dp"
-        android:hint="Simulated SDK call duration (seconds, optional)"
-        android:importantForAutofill="no"
-        android:inputType="number"
-        android:maxLength="10" />
-
-    <com.google.android.material.button.MaterialButton
-        android:id="@+id/stop_button"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:text="Simulate SDK call end" />
-
-    <TextView
-        android:id="@+id/session_status"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:text="No active call request" />
-
-    <TextView
-        android:id="@+id/recording_status"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:text="Android upload diagnostics (not part of the H5 callback)"
-        android:textIsSelectable="true" />
-
     <ScrollView
+        android:id="@+id/log_scroll"
         android:layout_width="match_parent"
         android:layout_height="0dp"
-        android:layout_weight="1">
+        android:layout_weight="1"
+        android:layout_marginTop="12dp"
+        android:fillViewport="true">
+
         <TextView
-            android:id="@+id/result"
+            android:id="@+id/log_text"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:fontFamily="monospace"
-            android:textIsSelectable="true" />
+            android:padding="8dp"
+            android:textSize="12sp"
+            android:textIsSelectable="true"
+            tools:text="12:00:00.000 I 录音已开始" />
+
     </ScrollView>
+
 </LinearLayout>

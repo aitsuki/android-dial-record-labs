@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
 
     <uses-feature
         android:name="android.hardware.telephony"
@@ -10,9 +11,13 @@
     <uses-permission android:name="android.permission.READ_PHONE_STATE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission
+        android:name="android.permission.FOREGROUND_SERVICE"
+        tools:ignore="ForegroundServicesPolicy" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
-    <uses-permission android:name="android.permission.READ_CALL_LOG" />
+    <uses-permission
+        android:name="android.permission.READ_CALL_LOG"
+        tools:ignore="SmsAndCallLogPolicy" />
 
     <application
         android:name=".LabApplication"
@@ -26,7 +31,7 @@
         android:theme="@style/Theme.DialRecordLabs">
 
         <activity
-            android:name=".ui.MainActivity"
+            android:name=".MainActivity"
             android:exported="true"
             android:windowSoftInputMode="adjustResize">
             <intent-filter>
@@ -36,10 +41,11 @@
         </activity>
 
         <service
-            android:name=".accessibility.CallAccessibilityService"
+            android:name=".recording.CallAccessibilityService"
             android:exported="true"
             android:label="Dial Record Labs"
-            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE"
+            tools:ignore="AccessibilityPolicy">
 
             <intent-filter>
                 <action android:name="android.accessibilityservice.AccessibilityService" />
