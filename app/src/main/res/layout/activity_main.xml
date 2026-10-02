@@ -22,24 +22,13 @@
         android:layout_height="wrap_content"
         android:text="Start request" />
 
-    <ScrollView
-        android:id="@+id/log_scroll"
+    <androidx.recyclerview.widget.RecyclerView
+        android:id="@+id/log_list"
         android:layout_width="match_parent"
         android:layout_height="0dp"
         android:layout_weight="1"
         android:layout_marginTop="12dp"
-        android:fillViewport="true">
-
-        <TextView
-            android:id="@+id/log_text"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:fontFamily="monospace"
-            android:padding="8dp"
-            android:textSize="12sp"
-            android:textIsSelectable="true"
-            tools:text="12:00:00.000 I 录音已开始" />
-
-    </ScrollView>
+        android:paddingHorizontal="8dp"
+        android:scrollbars="vertical" />
 
 </LinearLayout>

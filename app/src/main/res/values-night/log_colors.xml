@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="log_time">#A0A0A0</color>
+    <color name="log_debug">#90CAF9</color>
+    <color name="log_info">#81C784</color>
+    <color name="log_warn">#FFD54F</color>
+    <color name="log_error">#EF9A9A</color>
+    <color name="log_divider">#424242</color>
+</resources>

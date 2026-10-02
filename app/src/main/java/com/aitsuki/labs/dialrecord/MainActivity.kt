@@ -11,7 +11,6 @@ import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
-import android.view.View
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AlertDialog
@@ -21,6 +20,8 @@ import androidx.core.content.ContextCompat
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
 import com.aitsuki.labs.dialrecord.databinding.ActivityMainBinding
+import androidx.recyclerview.widget.LinearLayoutManager
+import androidx.recyclerview.widget.RecyclerView
 import com.aitsuki.labs.dialrecord.recording.CallAccessibilityService
 import com.aitsuki.labs.dialrecord.recording.CallRequest
 import com.aitsuki.labs.dialrecord.recording.CallRequestController
@@ -30,13 +31,14 @@ import java.util.UUID
 /** 页面只负责授权、输入校验和展示；请求交接与资源生命周期交给控制器。 */
 class MainActivity : AppCompatActivity() {
     private lateinit var binding: ActivityMainBinding
-    private val logListener: (String) -> Unit = { logs ->
-        val scroll = binding.logScroll
-        val followLatest = !scroll.canScrollVertically(1)
-        binding.logText.text = logs
-        if (followLatest) {
-            scroll.post { scroll.fullScroll(View.FOCUS_DOWN) }
+    private var followLatestLogs = true
+    private val logAdapter = LogAdapter { itemCount ->
+        if (followLatestLogs && itemCount > 0) {
+            binding.logList.scrollToPosition(itemCount - 1)
         }
+    }
+    private val logListener: (List<AppLog.Entry>) -> Unit = { logs ->
+        logAdapter.submitList(logs)
     }
 
     private val requiredPermissions =
@@ -108,6 +110,21 @@ class MainActivity : AppCompatActivity() {
         enableEdgeToEdge()
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
+        binding.logList.apply {
+            layoutManager = LinearLayoutManager(this@MainActivity).apply {
+                // 数据旧 → 新，显示新 → 旧；日志不足一屏时也从顶部排列。
+                reverseLayout = true
+                stackFromEnd = true
+            }
+            adapter = logAdapter
+            // 高频日志无需插入动画，避免闪烁和额外布局开销。
+            itemAnimator = null
+            addOnScrollListener(object : RecyclerView.OnScrollListener() {
+                override fun onScrolled(recyclerView: RecyclerView, dx: Int, dy: Int) {
+                    followLatestLogs = !recyclerView.canScrollVertically(-1)
+                }
+            })
+        }
         val contentPaddingPx = (24 * resources.displayMetrics.density).toInt()
         ViewCompat.setOnApplyWindowInsetsListener(binding.root) { rootView, windowInsets ->
             val systemBarAndImeInsets =
